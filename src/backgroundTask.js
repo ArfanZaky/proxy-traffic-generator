@@ -1,6 +1,7 @@
 const { scrapeProxies, parseCustomProxies } = require('./proxyScraper');
 const { accessWithProxy, verifyProxy } = require('./accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./proxyHistory');
+const { getProxies: getCachedProxies } = require('./proxyCache');
 
 /**
  * Background Task Manager
@@ -29,6 +30,9 @@ class BackgroundTaskManager {
         successCount: this.task.successCount,
         failCount: this.task.failCount,
         completedCount: this.task.completedCount,
+        totalSuccessCount: this.task.totalSuccessCount,
+        totalFailCount: this.task.totalFailCount,
+        totalCompletedCount: this.task.totalCompletedCount,
         startedAt: this.task.startedAt,
         loopMode: this.task.loopMode,
         loopCount: this.task.loopCount,
@@ -119,6 +123,10 @@ class BackgroundTaskManager {
       successCount: 0,
       failCount: 0,
       completedCount: 0,
+      // Cumulative counters across all loops (for infinite mode display)
+      totalSuccessCount: 0,
+      totalFailCount: 0,
+      totalCompletedCount: 0,
       startedAt: new Date().toISOString(),
       loopMode,
       loopCount,
@@ -191,13 +199,20 @@ class BackgroundTaskManager {
 
           this.addLog(`✅ Loaded ${proxies.length} custom proxies`);
         } else {
-          this.addLog('🔄 Scraping proxies from multiple sources...');
+          this.addLog('🔄 Loading proxies (cached or fresh scrape)...');
 
-          const allProxies = await scrapeProxies();
+          const cacheResult = await getCachedProxies();
+          const allProxies = cacheResult.proxies;
+
+          if (cacheResult.fromCache) {
+            this.addLog(`📦 Using cached proxies (age: ${cacheResult.cacheAge}s, ${allProxies.length} proxies)`);
+          } else {
+            this.addLog(`🔄 Fresh scrape completed: ${allProxies.length} proxies found`);
+          }
 
           proxies = allProxies.filter(p => p.country && p.country !== 'Unknown');
 
-          this.addLog(`✅ Found ${allProxies.length} total proxies, ${proxies.length} with known country`);
+          this.addLog(`✅ ${proxies.length} proxies with known country`);
 
           if (proxies.length === 0) {
             this.addLog('⚠️ No proxies with known country, using all proxies...');
@@ -242,12 +257,11 @@ class BackgroundTaskManager {
         }
         this.addLog(`🚀 Starting ${totalAccess} access(es) with ${proxies.length} proxies`);
 
-        // Reset counts for this loop iteration (but keep cumulative for infinite)
-        if (!isInfinite) {
-          this.task.successCount = 0;
-          this.task.failCount = 0;
-          this.task.completedCount = 0;
-        }
+        // Reset counts for each loop iteration
+        // For infinite mode: reset per-loop counters so new batch of tasks can run
+        this.task.successCount = 0;
+        this.task.failCount = 0;
+        this.task.completedCount = 0;
 
         let proxyUsageIndex = 0;
         const shuffledProxies = [...proxies].sort(() => Math.random() - 0.5);
@@ -305,6 +319,8 @@ class BackgroundTaskManager {
                 const result = await accessWithProxy(targetUrl, proxy, useHeadless);
                 this.task.successCount++;
                 this.task.completedCount++;
+                this.task.totalSuccessCount++;
+                this.task.totalCompletedCount++;
 
                 recordProxyResult(targetUrl, proxy, true);
 
@@ -325,9 +341,14 @@ class BackgroundTaskManager {
                 // Broadcast progress
                 this.io.emit('bg-progress', {
                   completed: this.task.completedCount,
-                  total: isInfinite ? -1 : totalAccess,
+                  total: totalAccess,
                   success: this.task.successCount,
-                  failed: this.task.failCount
+                  failed: this.task.failCount,
+                  isInfinite,
+                  currentLoop: this.task.currentLoop,
+                  totalCompleted: this.task.totalCompletedCount,
+                  totalSuccess: this.task.totalSuccessCount,
+                  totalFailed: this.task.totalFailCount
                 });
 
                 return result;
@@ -344,6 +365,8 @@ class BackgroundTaskManager {
             // All retries failed
             this.task.failCount++;
             this.task.completedCount++;
+            this.task.totalFailCount++;
+            this.task.totalCompletedCount++;
 
             this.addResult({
               index: taskIndex + 1,
@@ -357,9 +380,14 @@ class BackgroundTaskManager {
 
             this.io.emit('bg-progress', {
               completed: this.task.completedCount,
-              total: isInfinite ? -1 : totalAccess,
+              total: totalAccess,
               success: this.task.successCount,
-              failed: this.task.failCount
+              failed: this.task.failCount,
+              isInfinite,
+              currentLoop: this.task.currentLoop,
+              totalCompleted: this.task.totalCompletedCount,
+              totalSuccess: this.task.totalSuccessCount,
+              totalFailed: this.task.totalFailCount
             });
 
             return null;
@@ -408,6 +436,10 @@ class BackgroundTaskManager {
       const p = task().then(result => {
         executing.splice(executing.indexOf(p), 1);
         results.push(result);
+      }).catch(err => {
+        // Ensure promise is removed from executing even on error
+        executing.splice(executing.indexOf(p), 1);
+        results.push(null);
       });
       executing.push(p);
 
@@ -416,7 +448,10 @@ class BackgroundTaskManager {
       }
     }
 
-    await Promise.all(executing);
+    // Wait for remaining tasks, with error handling
+    if (executing.length > 0) {
+      await Promise.allSettled(executing);
+    }
     return results;
   }
 }

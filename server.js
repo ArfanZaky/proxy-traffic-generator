@@ -8,6 +8,7 @@ const path = require('path');
 const { scrapeProxies, parseCustomProxies } = require('./src/proxyScraper');
 const { accessWithProxy, verifyProxy } = require('./src/accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./src/proxyHistory');
+const { getProxies: getCachedProxies, getCacheStats, clearCache: clearProxyCache } = require('./src/proxyCache');
 const BackgroundTaskManager = require('./src/backgroundTask');
 
 const app = express();
@@ -26,17 +27,15 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Background task manager
 const bgTaskManager = new BackgroundTaskManager(io);
 
-// Store scraped proxies
-let cachedProxies = [];
 let isRunning = false;
 let activeConnections = new Map();
 
 // API: Get fresh proxies
 app.get('/api/proxies', async (req, res) => {
   try {
-    const proxies = await scrapeProxies();
-    cachedProxies = proxies;
-    res.json({ success: true, count: proxies.length, proxies });
+    const forceRefresh = req.query.refresh === 'true';
+    const cacheResult = await getCachedProxies({ forceRefresh });
+    res.json({ success: true, count: cacheResult.proxies.length, proxies: cacheResult.proxies, fromCache: cacheResult.fromCache, cacheAge: cacheResult.cacheAge });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -79,6 +78,16 @@ app.get('/api/background/results', (req, res) => {
   const offset = parseInt(req.query.offset) || 0;
   const limit = parseInt(req.query.limit) || 50;
   res.json({ results: bgTaskManager.getResults(offset, limit), total: bgTaskManager.results.length });
+});
+
+// === PROXY CACHE API ===
+app.get('/api/cache/status', (req, res) => {
+  res.json(getCacheStats());
+});
+
+app.post('/api/cache/clear', (req, res) => {
+  clearProxyCache();
+  res.json({ success: true, message: 'Proxy cache cleared' });
 });
 
 /**
@@ -134,9 +143,16 @@ io.on('connection', (socket) => {
     let successCount = 0;
     let failCount = 0;
     let completedCount = 0;
+    // Cumulative counters across all loops (for infinite mode)
+    let totalSuccessCount = 0;
+    let totalFailCount = 0;
+    let totalCompletedCount = 0;
+    let currentLoop = 0;
     
     for (let loop = 0; (isInfinite ? true : loop < totalLoops); loop++) {
       if (!isRunning) break;
+
+      currentLoop = loop + 1;
 
       if (loopMode && !isInfinite && totalLoops > 1) {
         socket.emit('log', { message: `\n🔁 Loop ${loop + 1}/${totalLoops}` });
@@ -160,16 +176,22 @@ io.on('connection', (socket) => {
           
           socket.emit('log', { message: `✅ Loaded ${proxies.length} custom proxies` });
         } else {
-          // Auto-scrape proxies
-          socket.emit('log', { message: '🔄 Scraping proxies from multiple sources...' });
+          // Auto-scrape proxies (with caching)
+          socket.emit('log', { message: '🔄 Loading proxies (cached or fresh scrape)...' });
           
-          const allProxies = await scrapeProxies();
-          cachedProxies = allProxies;
+          const cacheResult = await getCachedProxies();
+          const allProxies = cacheResult.proxies;
+          
+          if (cacheResult.fromCache) {
+            socket.emit('log', { message: `📦 Using cached proxies (age: ${cacheResult.cacheAge}s, ${allProxies.length} proxies)` });
+          } else {
+            socket.emit('log', { message: `🔄 Fresh scrape completed: ${allProxies.length} proxies found` });
+          }
           
           // Use all proxies (filter out only Unknown country)
           proxies = allProxies.filter(p => p.country && p.country !== 'Unknown');
           
-          socket.emit('log', { message: `✅ Found ${allProxies.length} total proxies, ${proxies.length} with known country (Elite: ${proxies.filter(p => p.anonymity === 'elite').length})` });
+          socket.emit('log', { message: `✅ ${proxies.length} proxies with known country (Elite: ${proxies.filter(p => p.anonymity === 'elite').length})` });
           
           if (proxies.length === 0) {
             socket.emit('log', { message: '⚠️ No proxies with known country, using all proxies...' });
@@ -224,12 +246,10 @@ io.on('connection', (socket) => {
         socket.emit('log', { message: `⚡ Concurrency: ${concurrency} parallel requests` });
         socket.emit('log', { message: `⏱️ Delay: ${delayMin}ms - ${delayMax}ms between batches` });
 
-        // Reset per-loop counters (for non-infinite mode)
-        if (!isInfinite) {
-          successCount = 0;
-          failCount = 0;
-          completedCount = 0;
-        }
+        // Reset per-loop counters for each loop iteration
+        successCount = 0;
+        failCount = 0;
+        completedCount = 0;
         let proxyUsageIndex = 0;
 
         // Shuffle proxies for randomness
@@ -309,6 +329,8 @@ io.on('connection', (socket) => {
                 const result = await accessWithProxy(targetUrl, proxy, useHeadless);
                 successCount++;
                 completedCount++;
+                totalSuccessCount++;
+                totalCompletedCount++;
                 
                 // Record proxy success in history
                 recordProxyResult(targetUrl, proxy, true);
@@ -328,9 +350,14 @@ io.on('connection', (socket) => {
                 });
                 socket.emit('progress', {
                   completed: completedCount,
-                  total: isInfinite ? -1 : totalAccess,
+                  total: totalAccess,
                   success: successCount,
-                  failed: failCount
+                  failed: failCount,
+                  isInfinite,
+                  currentLoop,
+                  totalCompleted: totalCompletedCount,
+                  totalSuccess: totalSuccessCount,
+                  totalFailed: totalFailCount
                 });
 
                 return result;
@@ -351,6 +378,8 @@ io.on('connection', (socket) => {
             // All retries failed
             failCount++;
             completedCount++;
+            totalFailCount++;
+            totalCompletedCount++;
             
             socket.emit('result', {
               index: taskIndex + 1,
@@ -363,9 +392,14 @@ io.on('connection', (socket) => {
             });
             socket.emit('progress', {
               completed: completedCount,
-              total: isInfinite ? -1 : totalAccess,
+              total: totalAccess,
               success: successCount,
-              failed: failCount
+              failed: failCount,
+              isInfinite,
+              currentLoop,
+              totalCompleted: totalCompletedCount,
+              totalSuccess: totalSuccessCount,
+              totalFailed: totalFailCount
             });
 
             return null;

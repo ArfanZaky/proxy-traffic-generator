@@ -330,24 +330,23 @@ socket.on('proxies-count', (data) => {
 });
 
 socket.on('progress', (data) => {
-    successCount = data.success;
-    failCount = data.failed;
-    const completed = data.completed;
-    const total = data.total;
+    const { completed, total, success, failed, isInfinite: isInf, currentLoop: loop, totalCompleted, totalSuccess, totalFailed } = data;
     
-    // Update progress bar
-    if (total === -1 || totalRequests === Infinity) {
-        // Infinite loop mode - show pulsing bar
-        progressFill.style.width = '100%';
-        progressFill.style.opacity = '0.6';
-        progressPercent.textContent = '∞';
-        progressLabel.textContent = `${completed} completed`;
+    // Progress bar always shows per-loop progress
+    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+    progressFill.style.width = `${percent}%`;
+    progressFill.style.opacity = '';
+    progressPercent.textContent = `${percent}%`;
+    
+    if (isInf) {
+        progressLabel.textContent = `${completed} / ${total} (Loop ${loop || '?'})`;
+        // Use cumulative stats for infinite mode
+        successCount = totalSuccess !== undefined ? totalSuccess : success;
+        failCount = totalFailed !== undefined ? totalFailed : failed;
     } else {
-        const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
-        progressFill.style.width = `${percent}%`;
-        progressFill.style.opacity = '';
-        progressPercent.textContent = `${percent}%`;
         progressLabel.textContent = `${completed} / ${total}`;
+        successCount = success;
+        failCount = failed;
     }
     
     updateStats();
@@ -509,10 +508,17 @@ async function checkBgStatus() {
         const data = await res.json();
         
         if (data.running) {
+            const isInfiniteMode = data.task.loopCount === -1;
+            
+            // For infinite mode, show cumulative stats
+            const displaySuccess = isInfiniteMode ? (data.task.totalSuccessCount || data.task.successCount) : data.task.successCount;
+            const displayFailed = isInfiniteMode ? (data.task.totalFailCount || data.task.failCount) : data.task.failCount;
+            const displayCompleted = isInfiniteMode ? (data.task.totalCompletedCount || data.task.completedCount) : data.task.completedCount;
+            
             // Status bar
             bgStatusBar.style.display = 'flex';
             bgStatusIndicator.className = 'bg-status-indicator running';
-            bgStatusText.textContent = `Running: ${data.task.url} | ✅${data.task.successCount} ❌${data.task.failCount} (Loop ${data.task.currentLoop})`;
+            bgStatusText.textContent = `Running: ${data.task.url} | ✅${displaySuccess} ❌${displayFailed} (Loop ${data.task.currentLoop})`;
             bgStopBtn.style.display = 'inline-block';
             
             // Monitor panel
@@ -521,16 +527,16 @@ async function checkBgStatus() {
             bgMonitorState.textContent = '🟢 Running';
             bgMonitorUrl.textContent = data.task.url;
             bgMonitorStarted.textContent = new Date(data.task.startedAt).toLocaleString();
-            bgMonitorLoop.textContent = data.task.loopCount === -1 ? `${data.task.currentLoop} (∞)` : `${data.task.currentLoop} / ${data.task.loopCount || 1}`;
+            bgMonitorLoop.textContent = isInfiniteMode ? `${data.task.currentLoop} (∞)` : `${data.task.currentLoop} / ${data.task.loopCount || 1}`;
             bgMonitorProxies.textContent = data.task.proxyCount;
-            bgMonitorSuccess.textContent = data.task.successCount;
-            bgMonitorFailed.textContent = data.task.failCount;
-            bgMonitorCompleted.textContent = data.task.completedCount;
+            bgMonitorSuccess.textContent = displaySuccess;
+            bgMonitorFailed.textContent = displayFailed;
+            bgMonitorCompleted.textContent = displayCompleted;
             bgMonitorTarget.textContent = data.task.totalAccess;
             
-            // Progress
+            // Progress - shows per-loop progress
             const total = data.task.totalAccess;
-            const completed = data.task.completedCount;
+            const completed = data.task.completedCount; // per-loop completed
             if (total > 0) {
                 const pct = Math.round((completed / total) * 100);
                 bgMonitorProgressFill.style.width = `${pct}%`;
@@ -629,37 +635,58 @@ socket.on('bg-result', (data) => {
 
 socket.on('bg-progress', (data) => {
     progressContainer.style.display = 'block';
-    const { completed, total, success, failed } = data;
-    if (total === -1) {
-        progressFill.style.width = '100%';
-        progressPercent.textContent = '∞';
-        progressLabel.textContent = `${completed} done`;
+    const { completed, total, success, failed, isInfinite, currentLoop, totalCompleted, totalSuccess, totalFailed } = data;
+    
+    // Progress bar always shows per-loop progress (completed/total per loop)
+    const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+    progressFill.style.width = `${percent}%`;
+    progressFill.style.opacity = '';
+    progressPercent.textContent = `${percent}%`;
+    
+    if (isInfinite) {
+        progressLabel.textContent = `${completed} / ${total} (Loop ${currentLoop || '?'})`;
+        // Show cumulative stats for infinite mode
+        const displaySuccess = totalSuccess !== undefined ? totalSuccess : success;
+        const displayFailed = totalFailed !== undefined ? totalFailed : failed;
+        const displayCompleted = totalCompleted !== undefined ? totalCompleted : completed;
+        statTotal.textContent = displayCompleted;
+        statSuccess.textContent = displaySuccess;
+        statFailed.textContent = displayFailed;
+        if (displayCompleted > 0) {
+            statRate.textContent = `${Math.round((displaySuccess / displayCompleted) * 100)}%`;
+        }
     } else {
-        const percent = Math.round((completed / total) * 100);
-        progressFill.style.width = `${percent}%`;
-        progressPercent.textContent = `${percent}%`;
         progressLabel.textContent = `${completed} / ${total}`;
-    }
-    statTotal.textContent = completed;
-    statSuccess.textContent = success;
-    statFailed.textContent = failed;
-    if (completed > 0) {
-        statRate.textContent = `${Math.round((success / completed) * 100)}%`;
+        statTotal.textContent = completed;
+        statSuccess.textContent = success;
+        statFailed.textContent = failed;
+        if (completed > 0) {
+            statRate.textContent = `${Math.round((success / completed) * 100)}%`;
+        }
     }
     
     // Update monitor panel stats in real-time
     if (bgMonitorPanel && bgMonitorPanel.style.display !== 'none') {
-        bgMonitorSuccess.textContent = success;
-        bgMonitorFailed.textContent = failed;
-        bgMonitorCompleted.textContent = completed;
-        bgMonitorTarget.textContent = total === -1 ? '∞' : total;
-        if (total > 0) {
-            const pct = Math.round((completed / total) * 100);
-            bgMonitorProgressFill.style.width = `${pct}%`;
-            bgMonitorProgressText.textContent = `${pct}%`;
+        if (isInfinite) {
+            const displaySuccess = totalSuccess !== undefined ? totalSuccess : success;
+            const displayFailed = totalFailed !== undefined ? totalFailed : failed;
+            const displayCompleted = totalCompleted !== undefined ? totalCompleted : completed;
+            bgMonitorSuccess.textContent = displaySuccess;
+            bgMonitorFailed.textContent = displayFailed;
+            bgMonitorCompleted.textContent = displayCompleted;
+            bgMonitorTarget.textContent = total;
         } else {
-            bgMonitorProgressFill.style.width = '100%';
-            bgMonitorProgressText.textContent = '∞';
+            bgMonitorSuccess.textContent = success;
+            bgMonitorFailed.textContent = failed;
+            bgMonitorCompleted.textContent = completed;
+            bgMonitorTarget.textContent = total;
+        }
+        const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+        bgMonitorProgressFill.style.width = `${pct}%`;
+        bgMonitorProgressText.textContent = `${pct}%`;
+        
+        if (currentLoop) {
+            bgMonitorLoop.textContent = isInfinite ? `${currentLoop} (∞)` : currentLoop;
         }
     }
 });
@@ -731,3 +758,50 @@ startBtn.addEventListener('click', async (e) => {
         addLog(`❌ Failed to start background task: ${err.message}`, 'error');
     }
 }, true); // Use capture phase to intercept before normal handler
+
+// === PROXY CACHE STATUS ===
+const cacheStatusBar = document.getElementById('cacheStatusBar');
+const cacheStatusText = document.getElementById('cacheStatusText');
+const cacheRefreshBtn = document.getElementById('cacheRefreshBtn');
+
+async function updateCacheStatus() {
+    try {
+        const res = await fetch('/api/cache/status');
+        const data = await res.json();
+        
+        if (data.cachedCount > 0 && data.isValid) {
+            const ageMin = Math.floor(data.cacheAge / 60);
+            const ageSec = data.cacheAge % 60;
+            const remaining = Math.ceil(data.ttlRemaining / 1000);
+            const remainMin = Math.floor(remaining / 60);
+            cacheStatusText.textContent = `Cache: ${data.cachedCount} proxies | Age: ${ageMin}m ${ageSec}s | Refresh in: ${remainMin}m | Hits: ${data.hits}`;
+            cacheStatusBar.className = 'cache-status-bar cache-fresh';
+        } else if (data.cachedCount > 0 && !data.isValid) {
+            cacheStatusText.textContent = `Cache: expired (${data.cachedCount} proxies) | Will refresh on next run`;
+            cacheStatusBar.className = 'cache-status-bar cache-expired';
+        } else {
+            cacheStatusText.textContent = 'Cache: empty (will scrape on first run)';
+            cacheStatusBar.className = 'cache-status-bar';
+        }
+    } catch (err) {
+        cacheStatusText.textContent = 'Cache: unable to fetch status';
+    }
+}
+
+if (cacheRefreshBtn) {
+    cacheRefreshBtn.addEventListener('click', async () => {
+        cacheRefreshBtn.classList.add('spinning');
+        try {
+            await fetch('/api/cache/clear', { method: 'POST' });
+            addLog('🗑️ Proxy cache cleared. Fresh proxies will be scraped on next run.', 'info');
+            await updateCacheStatus();
+        } catch (err) {
+            addLog('❌ Failed to clear cache', 'error');
+        }
+        cacheRefreshBtn.classList.remove('spinning');
+    });
+}
+
+// Update cache status on load and periodically
+updateCacheStatus();
+setInterval(updateCacheStatus, 30000); // Update every 30s

@@ -414,6 +414,66 @@ section h2 i {
     color: var(--accent-primary);
 }
 
+/* Cache Status Bar */
+.cache-status-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    margin-top: 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+}
+
+.cache-status-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-muted);
+}
+
+.cache-status-info i {
+    color: var(--accent-primary);
+}
+
+.cache-status-bar.cache-fresh .cache-status-info i {
+    color: #00e676;
+}
+
+.cache-status-bar.cache-expired .cache-status-info i {
+    color: #ff9800;
+}
+
+.btn-xs {
+    padding: 3px 8px;
+    font-size: 0.65rem;
+    border-radius: 4px;
+}
+
+.btn-cache-refresh {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.btn-cache-refresh:hover {
+    border-color: var(--accent-primary);
+    color: var(--accent-primary);
+}
+
+.btn-cache-refresh.spinning i {
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
 .custom-proxy-textarea {
     width: 100%;
     padding: 12px 14px;
