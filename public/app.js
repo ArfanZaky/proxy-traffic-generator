@@ -1,0 +1,733 @@
+// Connect to Socket.IO
+const socket = io();
+
+// DOM Elements
+const targetUrlInput = document.getElementById('targetUrl');
+const urlCountBadge = document.getElementById('urlCountBadge');
+const verifyUrlInput = document.getElementById('verifyUrl');
+const totalAccessInput = document.getElementById('totalAccess');
+const concurrencyInput = document.getElementById('concurrency');
+const headlessModeToggle = document.getElementById('headlessMode');
+const modeLabel = document.getElementById('modeLabel');
+const delayMinInput = document.getElementById('delayMin');
+const delayMaxInput = document.getElementById('delayMax');
+const loopModeToggle = document.getElementById('loopMode');
+const loopCountInput = document.getElementById('loopCount');
+const loopInfiniteToggle = document.getElementById('loopInfinite');
+const loopHint = document.getElementById('loopHint');
+const autoScrollToggle = document.getElementById('autoScroll');
+const customProxiesTextarea = document.getElementById('customProxies');
+const customProxyCount = document.getElementById('customProxyCount');
+const proxyAutoContent = document.getElementById('proxyAutoContent');
+const proxyCustomContent = document.getElementById('proxyCustomContent');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const clearBtn = document.getElementById('clearBtn');
+const logContainer = document.getElementById('logContainer');
+const resultsBody = document.getElementById('resultsBody');
+const resultCount = document.getElementById('resultCount');
+const progressContainer = document.getElementById('progressContainer');
+const progressFill = document.getElementById('progressFill');
+const progressPercent = document.getElementById('progressPercent');
+const progressLabel = document.getElementById('progressLabel');
+
+// Stats elements
+const statTotal = document.getElementById('statTotal');
+const statSuccess = document.getElementById('statSuccess');
+const statFailed = document.getElementById('statFailed');
+const statProxies = document.getElementById('statProxies');
+const statSpeed = document.getElementById('statSpeed');
+const statRate = document.getElementById('statRate');
+
+// State
+let isRunning = false;
+let totalRequests = 0;
+let successCount = 0;
+let failCount = 0;
+let startTime = null;
+let resultRows = 0;
+let proxySource = 'auto'; // 'auto' or 'custom'
+
+// Parse URLs from textarea (one per line)
+function parseUrls(text) {
+    return text.split('\n')
+        .map(u => u.trim())
+        .filter(u => u && (u.startsWith('http://') || u.startsWith('https://')));
+}
+
+// Update URL count badge
+function updateUrlCount() {
+    const urls = parseUrls(targetUrlInput.value);
+    const count = urls.length;
+    urlCountBadge.textContent = count === 1 ? '1 URL' : `${count} URLs`;
+    urlCountBadge.style.background = count > 1 ? '#00e676' : 'var(--accent-primary)';
+}
+targetUrlInput.addEventListener('input', updateUrlCount);
+updateUrlCount();
+
+// Proxy source switching
+function switchProxySource(source) {
+    proxySource = source;
+    document.querySelectorAll('.proxy-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.source === source);
+    });
+    proxyAutoContent.style.display = source === 'auto' ? 'block' : 'none';
+    proxyCustomContent.style.display = source === 'custom' ? 'block' : 'none';
+}
+window.switchProxySource = switchProxySource;
+
+// Custom proxy count updater
+if (customProxiesTextarea) {
+    customProxiesTextarea.addEventListener('input', () => {
+        const lines = customProxiesTextarea.value.split('\n').filter(l => {
+            const trimmed = l.trim();
+            if (!trimmed) return false;
+            // Match: http://user:pass@ip:port or user:pass@ip:port or ip:port
+            const urlFormat = /^(?:https?:\/\/)?(?:[^:@]+:[^@]+@)?\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$/;
+            return urlFormat.test(trimmed);
+        });
+        customProxyCount.textContent = `${lines.length} valid proxies entered`;
+    });
+}
+
+// Toggle headless mode label
+headlessModeToggle.addEventListener('change', () => {
+    if (headlessModeToggle.checked) {
+        modeLabel.textContent = 'Headless (Hidden)';
+    } else {
+        modeLabel.textContent = 'Visible Browser';
+    }
+});
+
+// Toggle loop mode
+loopModeToggle.addEventListener('change', () => {
+    loopCountInput.disabled = !loopModeToggle.checked;
+    loopInfiniteToggle.disabled = !loopModeToggle.checked;
+    if (loopModeToggle.checked) {
+        loopCountInput.value = 3;
+    } else {
+        loopInfiniteToggle.checked = false;
+        loopCountInput.style.opacity = '';
+        loopHint.textContent = 'times';
+    }
+});
+
+// Toggle infinite loop
+loopInfiniteToggle.addEventListener('change', () => {
+    if (loopInfiniteToggle.checked) {
+        loopCountInput.style.opacity = '0.3';
+        loopCountInput.disabled = true;
+        loopHint.textContent = '∞ unlimited';
+        loopHint.style.color = '#f39c12';
+    } else {
+        loopCountInput.style.opacity = '';
+        loopCountInput.disabled = false;
+        loopHint.textContent = 'times';
+        loopHint.style.color = '';
+    }
+});
+
+// Preset configurations
+function applyPreset(preset) {
+    switch (preset) {
+        case 'light':
+            totalAccessInput.value = 10;
+            concurrencyInput.value = 3;
+            delayMinInput.value = 1000;
+            delayMaxInput.value = 3000;
+            loopModeToggle.checked = false;
+            loopCountInput.disabled = true;
+            loopCountInput.value = 1;
+            loopInfiniteToggle.checked = false;
+            loopInfiniteToggle.disabled = true;
+            loopCountInput.style.opacity = '';
+            loopHint.textContent = 'times';
+            loopHint.style.color = '';
+            break;
+        case 'medium':
+            totalAccessInput.value = 50;
+            concurrencyInput.value = 10;
+            delayMinInput.value = 300;
+            delayMaxInput.value = 1500;
+            loopModeToggle.checked = false;
+            loopCountInput.disabled = true;
+            loopCountInput.value = 1;
+            loopInfiniteToggle.checked = false;
+            loopInfiniteToggle.disabled = true;
+            loopCountInput.style.opacity = '';
+            loopHint.textContent = 'times';
+            loopHint.style.color = '';
+            break;
+        case 'heavy':
+            totalAccessInput.value = 200;
+            concurrencyInput.value = 25;
+            delayMinInput.value = 100;
+            delayMaxInput.value = 800;
+            loopModeToggle.checked = true;
+            loopCountInput.disabled = false;
+            loopCountInput.value = 3;
+            loopInfiniteToggle.checked = false;
+            loopInfiniteToggle.disabled = false;
+            loopCountInput.style.opacity = '';
+            loopHint.textContent = 'times';
+            loopHint.style.color = '';
+            break;
+        case 'extreme':
+            totalAccessInput.value = 500;
+            concurrencyInput.value = 50;
+            delayMinInput.value = 0;
+            delayMaxInput.value = 300;
+            loopModeToggle.checked = true;
+            loopCountInput.disabled = true;
+            loopCountInput.value = 5;
+            loopInfiniteToggle.checked = true;
+            loopInfiniteToggle.disabled = false;
+            loopCountInput.style.opacity = '0.3';
+            loopHint.textContent = '∞ unlimited';
+            loopHint.style.color = '#f39c12';
+            break;
+    }
+    addLog(`⚡ Preset "${preset}" applied`, 'warning');
+}
+
+// Make applyPreset available globally
+window.applyPreset = applyPreset;
+
+// Start button
+startBtn.addEventListener('click', () => {
+    const urls = parseUrls(targetUrlInput.value);
+    const url = urls[0] || ''; // Primary URL for backward compat
+    const verifyUrl = verifyUrlInput.value.trim();
+    const totalAccess = parseInt(totalAccessInput.value);
+    const concurrency = parseInt(concurrencyInput.value);
+    const useHeadless = headlessModeToggle.checked;
+    const delayMin = parseInt(delayMinInput.value);
+    const delayMax = parseInt(delayMaxInput.value);
+    const loopMode = loopModeToggle.checked;
+    const loopInfinite = loopInfiniteToggle.checked && loopMode;
+    const loopCount = loopInfinite ? -1 : (parseInt(loopCountInput.value) || 1);
+
+    // Validation
+    if (urls.length === 0) {
+        addLog('❌ Please enter at least one valid URL (must start with http:// or https://)', 'error');
+        return;
+    }
+
+    if (!totalAccess || totalAccess < 1) {
+        addLog('❌ Total access must be at least 1', 'error');
+        return;
+    }
+
+    if (!concurrency || concurrency < 1 || concurrency > 50) {
+        addLog('❌ Concurrency must be between 1 and 50', 'error');
+        return;
+    }
+
+    if (delayMin > delayMax) {
+        addLog('❌ Min delay cannot be greater than max delay', 'error');
+        return;
+    }
+
+    if (proxySource === 'custom' && (!customProxiesTextarea.value.trim())) {
+        addLog('❌ Please enter at least one proxy in the custom proxy field', 'error');
+        return;
+    }
+
+    // Reset stats
+    totalRequests = loopInfinite ? Infinity : totalAccess * (loopMode ? loopCount : 1);
+    successCount = 0;
+    failCount = 0;
+    resultRows = 0;
+    startTime = Date.now();
+    updateStats();
+    
+    // Clear previous results
+    resultsBody.innerHTML = '';
+    resultCount.textContent = '(0)';
+    resultRows = 0;
+    
+    // Show progress
+    progressContainer.style.display = 'block';
+    progressFill.style.width = '0%';
+    progressPercent.textContent = '0%';
+    progressLabel.textContent = loopInfinite ? `0 / ∞` : `0 / ${totalRequests}`;
+
+    // Update UI
+    isRunning = true;
+    startBtn.disabled = true;
+    startBtn.classList.add('running');
+    stopBtn.disabled = false;
+    startBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Running...';
+
+    // Emit start event
+    const emitData = {
+        url,
+        urls,
+        verifyUrl,
+        totalAccess,
+        useHeadless,
+        concurrency,
+        delayMin,
+        delayMax,
+        loopMode,
+        loopCount,
+        proxySource
+    };
+
+    // Include custom proxies if using custom source
+    if (proxySource === 'custom') {
+        emitData.customProxies = customProxiesTextarea.value;
+    }
+
+    socket.emit('start-access', emitData);
+
+    const sourceLabel = proxySource === 'custom' ? 'Custom Proxies' : 'Auto-Scrape';
+    const loopLabel = loopInfinite ? '∞ unlimited loops' : (loopMode ? loopCount + ' loops' : '1 loop');
+    const totalLabel = loopInfinite ? '∞' : totalRequests;
+    const urlsLabel = urls.length > 1 ? `${urls.length} URLs (random)` : url;
+    addLog(`🚀 Starting traffic: ${totalAccess} requests × ${loopLabel} = ${totalLabel} total`, 'info');
+    addLog(`🌐 Target: ${urlsLabel}`, 'info');
+    if (urls.length > 1) urls.forEach((u, i) => addLog(`   ${i+1}. ${u}`, 'info'));
+    addLog(`⚡ Concurrency: ${concurrency} | Delay: ${delayMin}-${delayMax}ms | Mode: ${useHeadless ? 'Headless' : 'Visible'} | Proxy: ${sourceLabel}`, 'info');
+});
+
+// Stop button
+stopBtn.addEventListener('click', () => {
+    socket.emit('stop');
+    fetch('/api/stop', { method: 'POST' });
+    addLog('⛔ Stopping task...', 'warning');
+    resetUI();
+});
+
+// Clear button
+clearBtn.addEventListener('click', () => {
+    logContainer.innerHTML = '';
+    resultsBody.innerHTML = '<tr class="empty-row"><td colspan="7">No results yet. Click "Start Traffic" to begin.</td></tr>';
+    resultCount.textContent = '(0)';
+    successCount = 0;
+    failCount = 0;
+    totalRequests = 0;
+    resultRows = 0;
+    updateStats();
+    progressContainer.style.display = 'none';
+    statSpeed.textContent = '0';
+    statRate.textContent = '0%';
+    addLog('🧹 Cleared', 'info');
+});
+
+// Socket.IO event handlers
+socket.on('log', (data) => {
+    let type = 'info';
+    if (data.message.includes('✅')) type = 'success';
+    else if (data.message.includes('❌')) type = 'error';
+    else if (data.message.includes('⚠️') || data.message.includes('⛔')) type = 'warning';
+    
+    addLog(data.message, type);
+});
+
+socket.on('proxies-count', (data) => {
+    statProxies.textContent = data.count;
+});
+
+socket.on('progress', (data) => {
+    successCount = data.success;
+    failCount = data.failed;
+    const completed = data.completed;
+    const total = data.total;
+    
+    // Update progress bar
+    if (total === -1 || totalRequests === Infinity) {
+        // Infinite loop mode - show pulsing bar
+        progressFill.style.width = '100%';
+        progressFill.style.opacity = '0.6';
+        progressPercent.textContent = '∞';
+        progressLabel.textContent = `${completed} completed`;
+    } else {
+        const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+        progressFill.style.width = `${percent}%`;
+        progressFill.style.opacity = '';
+        progressPercent.textContent = `${percent}%`;
+        progressLabel.textContent = `${completed} / ${total}`;
+    }
+    
+    updateStats();
+    updateSpeed();
+});
+
+socket.on('result', (data) => {
+    addResultRow(data);
+});
+
+socket.on('complete', (data) => {
+    addLog(`\n🎉 Task completed! Success: ${data.successCount}, Failed: ${data.failCount}, Total: ${data.total}`, 'success');
+    resetUI();
+    progressFill.style.width = '100%';
+    progressPercent.textContent = '100%';
+});
+
+socket.on('error', (data) => {
+    addLog(data.message, 'error');
+    resetUI();
+});
+
+socket.on('disconnect', () => {
+    addLog('⚠️ Disconnected from server', 'warning');
+    resetUI();
+});
+
+socket.on('connect', () => {
+    addLog('🔌 Connected to server', 'success');
+});
+
+// Helper functions
+function addLog(message, type = 'info') {
+    const entry = document.createElement('div');
+    entry.className = `log-entry log-${type}`;
+    
+    const now = new Date();
+    const time = now.toLocaleTimeString('en-US', { hour12: false });
+    
+    entry.innerHTML = `<span class="log-time">[${time}]</span><span class="log-message">${escapeHtml(message)}</span>`;
+    
+    logContainer.appendChild(entry);
+    
+    // Limit log entries to prevent memory issues
+    while (logContainer.children.length > 500) {
+        logContainer.removeChild(logContainer.firstChild);
+    }
+    
+    if (autoScrollToggle.checked) {
+        logContainer.scrollTop = logContainer.scrollHeight;
+    }
+}
+
+function addResultRow(data) {
+    // Remove empty row if exists
+    const emptyRow = resultsBody.querySelector('.empty-row');
+    if (emptyRow) emptyRow.remove();
+
+    resultRows++;
+    resultCount.textContent = `(${resultRows})`;
+
+    const row = document.createElement('tr');
+    const statusClass = data.status === 'success' ? 'status-success' : 'status-failed';
+    const statusIcon = data.status === 'success' ? '✅' : '❌';
+    
+    row.innerHTML = `
+        <td>${data.index}</td>
+        <td>${escapeHtml(data.proxy)}</td>
+        <td>${escapeHtml(data.country || '-')}</td>
+        <td class="${statusClass}">${statusIcon}</td>
+        <td>${data.statusCode || '-'}</td>
+        <td>${data.responseTime ? data.responseTime + 'ms' : '-'}</td>
+        <td title="${escapeHtml(data.title || data.error || '-')}">${escapeHtml((data.title || data.error || '-').substring(0, 35))}</td>
+    `;
+    
+    // Add to top for latest first
+    if (resultsBody.firstChild) {
+        resultsBody.insertBefore(row, resultsBody.firstChild);
+    } else {
+        resultsBody.appendChild(row);
+    }
+
+    // Limit table rows to prevent memory issues
+    while (resultsBody.children.length > 200) {
+        resultsBody.removeChild(resultsBody.lastChild);
+    }
+}
+
+function updateStats() {
+    statTotal.textContent = totalRequests;
+    statSuccess.textContent = successCount;
+    statFailed.textContent = failCount;
+    
+    const total = successCount + failCount;
+    const rate = total > 0 ? Math.round((successCount / total) * 100) : 0;
+    statRate.textContent = `${rate}%`;
+}
+
+function updateSpeed() {
+    if (!startTime) return;
+    const elapsed = (Date.now() - startTime) / 1000 / 60; // minutes
+    const total = successCount + failCount;
+    const speed = elapsed > 0 ? Math.round(total / elapsed) : 0;
+    statSpeed.textContent = speed;
+}
+
+function resetUI() {
+    isRunning = false;
+    startBtn.disabled = false;
+    startBtn.classList.remove('running');
+    stopBtn.disabled = true;
+    startBtn.innerHTML = '<i class="fas fa-play"></i> Start Traffic';
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Update speed every 2 seconds while running
+setInterval(() => {
+    if (isRunning) {
+        updateSpeed();
+    }
+}, 2000);
+
+// === BACKGROUND MODE ===
+const bgModeToggle = document.getElementById('bgModeToggle');
+const bgModeLabel = document.getElementById('bgModeLabel');
+const bgStatusBar = document.getElementById('bgStatusBar');
+const bgStatusIndicator = document.getElementById('bgStatusIndicator');
+const bgStatusText = document.getElementById('bgStatusText');
+const bgStopBtn = document.getElementById('bgStopBtn');
+
+// Background Monitor Panel elements
+const bgMonitorPanel = document.getElementById('bgMonitorPanel');
+const bgMonitorPulse = document.getElementById('bgMonitorPulse');
+const bgMonitorState = document.getElementById('bgMonitorState');
+const bgMonitorStopBtn = document.getElementById('bgMonitorStopBtn');
+const bgMonitorUrl = document.getElementById('bgMonitorUrl');
+const bgMonitorStarted = document.getElementById('bgMonitorStarted');
+const bgMonitorLoop = document.getElementById('bgMonitorLoop');
+const bgMonitorProxies = document.getElementById('bgMonitorProxies');
+const bgMonitorSuccess = document.getElementById('bgMonitorSuccess');
+const bgMonitorFailed = document.getElementById('bgMonitorFailed');
+const bgMonitorCompleted = document.getElementById('bgMonitorCompleted');
+const bgMonitorTarget = document.getElementById('bgMonitorTarget');
+const bgMonitorProgressFill = document.getElementById('bgMonitorProgressFill');
+const bgMonitorProgressText = document.getElementById('bgMonitorProgressText');
+const bgMonitorLogs = document.getElementById('bgMonitorLogs');
+
+let bgLogsShown = 0;
+
+// Check background task status on page load
+async function checkBgStatus() {
+    try {
+        const res = await fetch('/api/background/status');
+        const data = await res.json();
+        
+        if (data.running) {
+            // Status bar
+            bgStatusBar.style.display = 'flex';
+            bgStatusIndicator.className = 'bg-status-indicator running';
+            bgStatusText.textContent = `Running: ${data.task.url} | ✅${data.task.successCount} ❌${data.task.failCount} (Loop ${data.task.currentLoop})`;
+            bgStopBtn.style.display = 'inline-block';
+            
+            // Monitor panel
+            bgMonitorPanel.style.display = 'block';
+            bgMonitorPulse.className = 'bg-pulse';
+            bgMonitorState.textContent = '🟢 Running';
+            bgMonitorUrl.textContent = data.task.url;
+            bgMonitorStarted.textContent = new Date(data.task.startedAt).toLocaleString();
+            bgMonitorLoop.textContent = data.task.loopCount === -1 ? `${data.task.currentLoop} (∞)` : `${data.task.currentLoop} / ${data.task.loopCount || 1}`;
+            bgMonitorProxies.textContent = data.task.proxyCount;
+            bgMonitorSuccess.textContent = data.task.successCount;
+            bgMonitorFailed.textContent = data.task.failCount;
+            bgMonitorCompleted.textContent = data.task.completedCount;
+            bgMonitorTarget.textContent = data.task.totalAccess;
+            
+            // Progress
+            const total = data.task.totalAccess;
+            const completed = data.task.completedCount;
+            if (total > 0) {
+                const pct = Math.round((completed / total) * 100);
+                bgMonitorProgressFill.style.width = `${pct}%`;
+                bgMonitorProgressText.textContent = `${pct}%`;
+            }
+            
+            // Logs (show new ones)
+            if (data.logs && data.logs.length > bgLogsShown) {
+                const newLogs = data.logs.slice(bgLogsShown);
+                newLogs.forEach(log => {
+                    const entry = document.createElement('div');
+                    entry.className = `bg-log-entry ${log.type || ''}`;
+                    entry.textContent = log.message;
+                    bgMonitorLogs.appendChild(entry);
+                });
+                bgLogsShown = data.logs.length;
+                bgMonitorLogs.scrollTop = bgMonitorLogs.scrollHeight;
+            }
+            
+        } else if (data.task) {
+            // Task finished
+            bgStatusBar.style.display = 'flex';
+            bgStatusIndicator.className = 'bg-status-indicator stopped';
+            bgStatusText.textContent = `Completed: ✅${data.task.successCount} ❌${data.task.failCount}`;
+            bgStopBtn.style.display = 'none';
+            
+            // Monitor panel - show completed state
+            bgMonitorPanel.style.display = 'block';
+            bgMonitorPulse.className = 'bg-pulse completed';
+            bgMonitorState.textContent = '🏁 Completed';
+            bgMonitorUrl.textContent = data.task.url;
+            bgMonitorStarted.textContent = new Date(data.task.startedAt).toLocaleString();
+            bgMonitorLoop.textContent = data.task.currentLoop;
+            bgMonitorProxies.textContent = data.task.proxyCount;
+            bgMonitorSuccess.textContent = data.task.successCount;
+            bgMonitorFailed.textContent = data.task.failCount;
+            bgMonitorCompleted.textContent = data.task.completedCount;
+            bgMonitorTarget.textContent = data.task.totalAccess;
+            bgMonitorProgressFill.style.width = '100%';
+            bgMonitorProgressText.textContent = '100%';
+        } else {
+            bgStatusBar.style.display = 'none';
+            bgMonitorPanel.style.display = 'none';
+        }
+    } catch (e) {
+        // ignore
+    }
+}
+
+// Check on load
+checkBgStatus();
+
+// Poll background status every 5 seconds
+setInterval(checkBgStatus, 5000);
+
+// Background stop button (status bar)
+if (bgStopBtn) {
+    bgStopBtn.addEventListener('click', async () => {
+        await fetch('/api/background/stop', { method: 'POST' });
+        addLog('⏹️ Background task stop requested', 'warning');
+        checkBgStatus();
+    });
+}
+
+// Background stop button (monitor panel)
+if (bgMonitorStopBtn) {
+    bgMonitorStopBtn.addEventListener('click', async () => {
+        await fetch('/api/background/stop', { method: 'POST' });
+        addLog('⏹️ Background task stop requested', 'warning');
+        bgMonitorPulse.className = 'bg-pulse stopped';
+        bgMonitorState.textContent = '⏹️ Stopping...';
+        setTimeout(checkBgStatus, 1500);
+    });
+}
+
+// Listen for background events via socket
+socket.on('bg-log', (data) => {
+    addLog(`[BG] ${data.message}`, data.type || 'info');
+    // Also add to monitor panel logs
+    if (bgMonitorLogs) {
+        const entry = document.createElement('div');
+        entry.className = `bg-log-entry ${data.type || ''}`;
+        entry.textContent = data.message;
+        bgMonitorLogs.appendChild(entry);
+        // Keep max 100 entries
+        while (bgMonitorLogs.children.length > 100) {
+            bgMonitorLogs.removeChild(bgMonitorLogs.firstChild);
+        }
+        bgMonitorLogs.scrollTop = bgMonitorLogs.scrollHeight;
+    }
+});
+
+socket.on('bg-result', (data) => {
+    addResultRow(data);
+});
+
+socket.on('bg-progress', (data) => {
+    progressContainer.style.display = 'block';
+    const { completed, total, success, failed } = data;
+    if (total === -1) {
+        progressFill.style.width = '100%';
+        progressPercent.textContent = '∞';
+        progressLabel.textContent = `${completed} done`;
+    } else {
+        const percent = Math.round((completed / total) * 100);
+        progressFill.style.width = `${percent}%`;
+        progressPercent.textContent = `${percent}%`;
+        progressLabel.textContent = `${completed} / ${total}`;
+    }
+    statTotal.textContent = completed;
+    statSuccess.textContent = success;
+    statFailed.textContent = failed;
+    if (completed > 0) {
+        statRate.textContent = `${Math.round((success / completed) * 100)}%`;
+    }
+    
+    // Update monitor panel stats in real-time
+    if (bgMonitorPanel && bgMonitorPanel.style.display !== 'none') {
+        bgMonitorSuccess.textContent = success;
+        bgMonitorFailed.textContent = failed;
+        bgMonitorCompleted.textContent = completed;
+        bgMonitorTarget.textContent = total === -1 ? '∞' : total;
+        if (total > 0) {
+            const pct = Math.round((completed / total) * 100);
+            bgMonitorProgressFill.style.width = `${pct}%`;
+            bgMonitorProgressText.textContent = `${pct}%`;
+        } else {
+            bgMonitorProgressFill.style.width = '100%';
+            bgMonitorProgressText.textContent = '∞';
+        }
+    }
+});
+
+socket.on('bg-complete', (data) => {
+    addLog(`🏁 Background task completed: ✅${data.successCount} ❌${data.failCount}`, 'success');
+    checkBgStatus();
+});
+
+// Override start button to support background mode
+const originalStartHandler = startBtn.onclick;
+startBtn.addEventListener('click', async (e) => {
+    if (!bgModeToggle || !bgModeToggle.checked) return; // Let normal handler work
+    
+    e.stopImmediatePropagation();
+    e.preventDefault();
+    
+    const urls = parseUrls(targetUrlInput.value);
+    const url = urls[0] || '';
+    if (urls.length === 0) {
+        addLog('❌ Please enter at least one valid target URL', 'error');
+        return;
+    }
+
+    const verifyUrl = verifyUrlInput.value.trim();
+    const totalAccess = parseInt(totalAccessInput.value) || 100;
+    const concurrency = parseInt(concurrencyInput.value) || 5;
+    const useHeadless = headlessModeToggle.checked;
+    const delayMin = parseInt(delayMinInput.value) || 500;
+    const delayMax = parseInt(delayMaxInput.value) || 2000;
+    const loopMode = loopModeToggle.checked;
+    const loopInfinite = loopInfiniteToggle.checked && loopMode;
+    const loopCount = loopInfinite ? -1 : (parseInt(loopCountInput.value) || 1);
+    const proxySource = document.querySelector('.proxy-tab.active')?.dataset?.source || 'auto';
+
+    const body = {
+        url,
+        urls,
+        verifyUrl,
+        totalAccess,
+        useHeadless,
+        concurrency,
+        delayMin,
+        delayMax,
+        loopMode,
+        loopCount,
+        proxySource
+    };
+
+    if (proxySource === 'custom') {
+        body.customProxies = customProxiesTextarea.value;
+    }
+
+    try {
+        const res = await fetch('/api/background/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        const result = await res.json();
+        
+        if (result.success) {
+            addLog('🖥️ Background task started! You can close this browser - task will keep running on server.', 'success');
+            checkBgStatus();
+        } else {
+            addLog(`❌ ${result.message}`, 'error');
+        }
+    } catch (err) {
+        addLog(`❌ Failed to start background task: ${err.message}`, 'error');
+    }
+}, true); // Use capture phase to intercept before normal handler
