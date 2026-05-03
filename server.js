@@ -9,6 +9,7 @@ const { scrapeProxies, parseCustomProxies } = require('./src/proxyScraper');
 const { accessWithProxy, verifyProxy } = require('./src/accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./src/proxyHistory');
 const { getProxies: getCachedProxies, getCacheStats, clearCache: clearProxyCache } = require('./src/proxyCache');
+const { filterProxiesByCountry } = require('./src/countryFilter');
 const BackgroundTaskManager = require('./src/backgroundTask');
 
 const app = express();
@@ -17,7 +18,10 @@ const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  }
+  },
+  pingTimeout: 120000,
+  pingInterval: 25000,
+  maxHttpBufferSize: 1e7
 });
 
 app.use(cors());
@@ -80,6 +84,20 @@ app.get('/api/background/results', (req, res) => {
   res.json({ results: bgTaskManager.getResults(offset, limit), total: bgTaskManager.results.length });
 });
 
+// Resume background task
+app.post('/api/background/resume', async (req, res) => {
+  const result = await bgTaskManager.resume();
+  res.json(result);
+});
+
+// Check if there's a resumable state
+app.get('/api/background/resumable', (req, res) => {
+  res.json({
+    hasResumable: bgTaskManager.hasResumableState(),
+    info: bgTaskManager.getResumableInfo()
+  });
+});
+
 // === PROXY CACHE API ===
 app.get('/api/cache/status', (req, res) => {
   res.json(getCacheStats());
@@ -124,7 +142,7 @@ io.on('connection', (socket) => {
   activeConnections.set(socket.id, { running: false });
 
   socket.on('start-access', async (data) => {
-    const { url, urls: rawUrls, verifyUrl = '', totalAccess, useHeadless, concurrency = 5, delayMin = 500, delayMax = 2000, loopMode = false, loopCount = 1, proxySource = 'auto', customProxies = '' } = data;
+    const { url, urls: rawUrls, verifyUrl = '', totalAccess, useHeadless, concurrency = 5, delayMin = 500, delayMax = 2000, loopMode = false, loopCount = 1, proxySource = 'auto', customProxies = '', countryWhitelist = [] } = data;
     
     // Support multiple URLs - use urls array if provided, otherwise fall back to single url
     const urls = (rawUrls && rawUrls.length > 0) ? rawUrls : (url ? [url] : []);
@@ -193,8 +211,15 @@ io.on('connection', (socket) => {
           
           socket.emit('log', { message: `✅ ${proxies.length} proxies with known country (Elite: ${proxies.filter(p => p.anonymity === 'elite').length})` });
           
+          // Apply country whitelist filter if specified
+          if (countryWhitelist && countryWhitelist.length > 0) {
+            const beforeCount = proxies.length;
+            proxies = filterProxiesByCountry(proxies, countryWhitelist);
+            socket.emit('log', { message: `🌍 Country whitelist [${countryWhitelist.join(', ')}]: ${proxies.length}/${beforeCount} proxies matched` });
+          }
+          
           if (proxies.length === 0) {
-            socket.emit('log', { message: '⚠️ No proxies with known country, using all proxies...' });
+            socket.emit('log', { message: '⚠️ No proxies matched filters, using all proxies...' });
             if (allProxies.length === 0) {
               socket.emit('error', { message: '❌ No proxies found. Please try again.' });
               isRunning = false;
@@ -245,6 +270,9 @@ io.on('connection', (socket) => {
         socket.emit('log', { message: `🖥️ Mode: ${useHeadless ? 'Headless Browser' : 'Visible Browser'} | Proxy: ${proxySource === 'custom' ? 'Custom' : 'Auto-Scrape'}` });
         socket.emit('log', { message: `⚡ Concurrency: ${concurrency} parallel requests` });
         socket.emit('log', { message: `⏱️ Delay: ${delayMin}ms - ${delayMax}ms between batches` });
+        if (countryWhitelist && countryWhitelist.length > 0) {
+          socket.emit('log', { message: `🌍 Country Whitelist: ${countryWhitelist.join(', ')}` });
+        }
 
         // Reset per-loop counters for each loop iteration
         successCount = 0;
@@ -409,9 +437,19 @@ io.on('connection', (socket) => {
         // Run tasks with concurrency limit
         await runParallel(tasks, concurrency);
 
-        socket.emit('log', { 
-          message: `\n📊 Summary: ${successCount} success, ${failCount} failed out of ${totalAccess} total` 
+        socket.emit('log', {
+          message: `\n📊 Summary: ${successCount} success, ${failCount} failed out of ${totalAccess} total`
         });
+
+        // Auto-refresh proxy cache if success rate is too low (< 20%)
+        if (proxySource !== 'custom' && completedCount > 0) {
+          const successRate = successCount / completedCount;
+          if (successRate < 0.2) {
+            socket.emit('log', { message: `⚠️ Low success rate (${Math.round(successRate * 100)}%) - refreshing proxy cache for next loop...` });
+            clearProxyCache();
+            socket.emit('log', { message: '🔄 Proxy cache cleared. Fresh proxies will be scraped on next loop.' });
+          }
+        }
 
         if (!isInfinite && (loop === totalLoops - 1 || !isRunning)) {
           socket.emit('complete', { successCount, failCount, total: totalAccess });

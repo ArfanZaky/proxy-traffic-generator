@@ -1,11 +1,18 @@
 const { scrapeProxies, parseCustomProxies } = require('./proxyScraper');
 const { accessWithProxy, verifyProxy } = require('./accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./proxyHistory');
-const { getProxies: getCachedProxies } = require('./proxyCache');
+const { getProxies: getCachedProxies, clearCache: clearProxyCache } = require('./proxyCache');
+const { filterProxiesByCountry } = require('./countryFilter');
+const fs = require('fs');
+const path = require('path');
+
+// State file for persistence (survive server restart)
+const STATE_FILE = path.join(__dirname, '..', 'data', 'task-state.json');
 
 /**
  * Background Task Manager
  * Runs tasks independently of client WebSocket connection
+ * Features: graceful shutdown, state persistence, resume capability
  */
 class BackgroundTaskManager {
   constructor(io) {
@@ -15,6 +22,12 @@ class BackgroundTaskManager {
     this.results = []; // Store last 1000 results
     this.maxLogs = 500;
     this.maxResults = 1000;
+    this._config = null; // Store config for resume
+    this._stopping = false; // Graceful shutdown flag
+    this._activePromises = 0; // Track active task promises
+
+    // Try to load saved state on startup
+    this._loadState();
   }
 
   getStatus() {
@@ -37,7 +50,9 @@ class BackgroundTaskManager {
         loopMode: this.task.loopMode,
         loopCount: this.task.loopCount,
         currentLoop: this.task.currentLoop,
-        proxyCount: this.task.proxyCount
+        proxyCount: this.task.proxyCount,
+        interrupted: this.task.interrupted || false,
+        interruptedAt: this.task.interruptedAt || null
       },
       logs: this.logs.slice(-100), // Return last 100 logs
       results: this.results.slice(-50) // Return last 50 results
@@ -71,11 +86,162 @@ class BackgroundTaskManager {
     this.io.emit('bg-result', data);
   }
 
-  stop() {
-    if (this.task) {
-      this.task.running = false;
-      this.addLog('⏹️ Background task stopped by user', 'warning');
+  stop(graceful = true) {
+    if (this.task && this.task.running) {
+      if (graceful) {
+        // Graceful shutdown: let active requests finish, don't start new ones
+        this._stopping = true;
+        this.task.running = false;
+        this.addLog('⏹️ Graceful shutdown initiated - waiting for active requests to finish...', 'warning');
+        
+        // Save state for potential resume
+        this._saveState();
+        
+        // Wait for active promises to complete (max 30s)
+        const checkInterval = setInterval(() => {
+          if (this._activePromises <= 0) {
+            clearInterval(checkInterval);
+            this._stopping = false;
+            this.addLog('✅ All active requests completed. Task stopped cleanly.', 'warning');
+            this._saveState();
+          }
+        }, 500);
+        
+        // Force stop after 30 seconds
+        setTimeout(() => {
+          clearInterval(checkInterval);
+          this._stopping = false;
+          this.addLog('⚠️ Force stopped after 30s timeout', 'warning');
+        }, 30000);
+      } else {
+        // Immediate stop
+        this.task.running = false;
+        this._stopping = false;
+        this.addLog('⏹️ Background task force-stopped', 'warning');
+      }
     }
+  }
+
+  /**
+   * Save task state to file for persistence across restarts
+   */
+  _saveState() {
+    try {
+      if (!this.task) return;
+      
+      const state = {
+        task: {
+          url: this.task.url,
+          urls: this.task.urls,
+          totalAccess: this.task.totalAccess,
+          successCount: this.task.successCount,
+          failCount: this.task.failCount,
+          completedCount: this.task.completedCount,
+          totalSuccessCount: this.task.totalSuccessCount,
+          totalFailCount: this.task.totalFailCount,
+          totalCompletedCount: this.task.totalCompletedCount,
+          startedAt: this.task.startedAt,
+          loopMode: this.task.loopMode,
+          loopCount: this.task.loopCount,
+          currentLoop: this.task.currentLoop,
+          proxyCount: this.task.proxyCount,
+          running: this.task.running,
+        },
+        config: this._config,
+        savedAt: new Date().toISOString(),
+      };
+
+      // Ensure data directory exists
+      const dir = path.dirname(STATE_FILE);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    } catch (e) {
+      // Silently fail - state saving is best-effort
+    }
+  }
+
+  /**
+   * Load saved state (called on startup)
+   */
+  _loadState() {
+    try {
+      if (!fs.existsSync(STATE_FILE)) return;
+      
+      const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      
+      if (data.task && data.config) {
+        // Don't auto-resume, just store for manual resume
+        this._savedState = data;
+        
+        // If task was running when server stopped, mark as interrupted
+        if (data.task.running) {
+          this.task = {
+            ...data.task,
+            running: false,
+            interrupted: true,
+            interruptedAt: data.savedAt,
+          };
+          this.addLog(`⚠️ Found interrupted task from ${data.savedAt}. Use resume to continue.`, 'warning');
+        }
+      }
+    } catch (e) {
+      // Silently fail
+    }
+  }
+
+  /**
+   * Resume an interrupted task
+   */
+  async resume() {
+    if (this.task && this.task.running) {
+      return { success: false, message: 'A task is already running' };
+    }
+
+    if (!this._savedState || !this._savedState.config) {
+      return { success: false, message: 'No saved state to resume from' };
+    }
+
+    const savedState = this._savedState;
+    this.addLog(`🔄 Resuming task from loop ${savedState.task.currentLoop}...`, 'info');
+    this.addLog(`📊 Previous progress: ✅${savedState.task.totalSuccessCount} ❌${savedState.task.totalFailCount}`, 'info');
+
+    // Start with saved config
+    const result = await this.start(savedState.config);
+    
+    if (result.success) {
+      // Restore cumulative counters
+      this.task.totalSuccessCount = savedState.task.totalSuccessCount || 0;
+      this.task.totalFailCount = savedState.task.totalFailCount || 0;
+      this.task.totalCompletedCount = savedState.task.totalCompletedCount || 0;
+      this.task.currentLoop = savedState.task.currentLoop || 0;
+    }
+
+    // Clear saved state
+    this._savedState = null;
+    try { fs.unlinkSync(STATE_FILE); } catch(e) {}
+
+    return result;
+  }
+
+  /**
+   * Check if there's a resumable state
+   */
+  hasResumableState() {
+    return !!(this._savedState && this._savedState.config && this._savedState.task.running);
+  }
+
+  getResumableInfo() {
+    if (!this._savedState) return null;
+    return {
+      url: this._savedState.task.url,
+      currentLoop: this._savedState.task.currentLoop,
+      totalSuccess: this._savedState.task.totalSuccessCount,
+      totalFailed: this._savedState.task.totalFailCount,
+      savedAt: this._savedState.savedAt,
+    };
   }
 
   async start(config) {
@@ -95,7 +261,8 @@ class BackgroundTaskManager {
       loopMode = false,
       loopCount = 1,
       proxySource = 'auto',
-      customProxies = ''
+      customProxies = '',
+      countryWhitelist = []
     } = config;
 
     // Support multiple URLs
@@ -109,6 +276,11 @@ class BackgroundTaskManager {
     // Store urls in config for _runTask
     config._urls = urls;
     config._primaryUrl = primaryUrl;
+
+    // Store config for resume capability
+    this._config = { ...config };
+    delete this._config._urls;
+    delete this._config._primaryUrl;
 
     // Reset logs and results
     this.logs = [];
@@ -141,6 +313,9 @@ class BackgroundTaskManager {
       this.addLog(`🚀 Background task started for: ${primaryUrl}`);
     }
     this.addLog(`⚙️ Config: ${totalAccess} accesses, concurrency ${concurrency}, delay ${delayMin}-${delayMax}ms`);
+    if (countryWhitelist && countryWhitelist.length > 0) {
+      this.addLog(`🌍 Country Whitelist: ${countryWhitelist.join(', ')}`);
+    }
 
     // Run in background (don't await - fire and forget)
     this._runTask(config).catch(err => {
@@ -163,7 +338,8 @@ class BackgroundTaskManager {
       loopMode = false,
       loopCount = 1,
       proxySource = 'auto',
-      customProxies = ''
+      customProxies = '',
+      countryWhitelist = []
     } = config;
 
     // Multiple URL support
@@ -214,8 +390,15 @@ class BackgroundTaskManager {
 
           this.addLog(`✅ ${proxies.length} proxies with known country`);
 
+          // Apply country whitelist filter if specified
+          if (countryWhitelist && countryWhitelist.length > 0) {
+            const beforeCount = proxies.length;
+            proxies = filterProxiesByCountry(proxies, countryWhitelist);
+            this.addLog(`🌍 Country whitelist [${countryWhitelist.join(', ')}]: ${proxies.length}/${beforeCount} proxies matched`);
+          }
+
           if (proxies.length === 0) {
-            this.addLog('⚠️ No proxies with known country, using all proxies...');
+            this.addLog('⚠️ No proxies matched filters, using all proxies...');
             if (allProxies.length === 0) {
               this.addLog('❌ No proxies found. Task stopped.', 'error');
               this.task.running = false;
@@ -399,6 +582,16 @@ class BackgroundTaskManager {
 
         this.addLog(`\n📊 Loop Summary: ${this.task.successCount} success, ${this.task.failCount} failed out of ${totalAccess}`);
 
+        // Auto-refresh proxy cache if success rate is too low (< 20%)
+        if (proxySource !== 'custom' && this.task.completedCount > 0) {
+          const successRate = this.task.successCount / this.task.completedCount;
+          if (successRate < 0.2) {
+            this.addLog(`⚠️ Low success rate (${Math.round(successRate * 100)}%) - refreshing proxy cache for next loop...`, 'warning');
+            clearProxyCache();
+            this.addLog('🔄 Proxy cache cleared. Fresh proxies will be scraped on next loop.');
+          }
+        }
+
       } catch (error) {
         this.addLog(`❌ Error in loop ${loop + 1}: ${error.message}`, 'error');
         if (!isInfinite) {
@@ -410,6 +603,9 @@ class BackgroundTaskManager {
         continue;
       }
 
+      // Periodic state save (every loop) for crash recovery
+      this._saveState();
+
       // Delay between loops
       if (loopMode && (isInfinite || loop < totalLoops - 1) && this.task.running) {
         this.addLog('⏳ Waiting 3s before next loop...');
@@ -418,12 +614,19 @@ class BackgroundTaskManager {
     }
 
     this.task.running = false;
+    this._stopping = false;
     this.addLog('🏁 Background task completed');
     this.io.emit('bg-complete', {
       successCount: this.task.successCount,
       failCount: this.task.failCount,
-      total: totalAccess
+      total: totalAccess,
+      totalSuccess: this.task.totalSuccessCount,
+      totalFailed: this.task.totalFailCount,
+      totalCompleted: this.task.totalCompletedCount
     });
+
+    // Clean up state file on normal completion
+    try { fs.unlinkSync(STATE_FILE); } catch(e) {}
   }
 
   async _runParallel(tasks, concurrency) {
@@ -431,13 +634,16 @@ class BackgroundTaskManager {
     const executing = [];
 
     for (const task of tasks) {
-      if (!this.task.running) break;
+      if (!this.task.running && !this._stopping) break;
+      if (this._stopping) break; // Don't start new tasks during graceful shutdown
 
+      this._activePromises++;
       const p = task().then(result => {
+        this._activePromises--;
         executing.splice(executing.indexOf(p), 1);
         results.push(result);
       }).catch(err => {
-        // Ensure promise is removed from executing even on error
+        this._activePromises--;
         executing.splice(executing.indexOf(p), 1);
         results.push(null);
       });
@@ -452,6 +658,7 @@ class BackgroundTaskManager {
     if (executing.length > 0) {
       await Promise.allSettled(executing);
     }
+    this._activePromises = 0; // Reset counter
     return results;
   }
 }

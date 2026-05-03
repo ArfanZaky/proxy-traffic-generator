@@ -1,10 +1,17 @@
-// Connect to Socket.IO
-const socket = io();
+// Connect to Socket.IO with reconnection settings
+const socket = io({
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
+    timeout: 120000
+});
 
 // DOM Elements
 const targetUrlInput = document.getElementById('targetUrl');
 const urlCountBadge = document.getElementById('urlCountBadge');
 const verifyUrlInput = document.getElementById('verifyUrl');
+const countryWhitelistInput = document.getElementById('countryWhitelist');
 const totalAccessInput = document.getElementById('totalAccess');
 const concurrencyInput = document.getElementById('concurrency');
 const headlessModeToggle = document.getElementById('headlessMode');
@@ -259,6 +266,9 @@ startBtn.addEventListener('click', () => {
     stopBtn.disabled = false;
     startBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Running...';
 
+    // Parse country whitelist
+    const countryWhitelist = countryWhitelistInput ? countryWhitelistInput.value.trim().split(',').map(c => c.trim()).filter(c => c) : [];
+
     // Emit start event
     const emitData = {
         url,
@@ -271,7 +281,8 @@ startBtn.addEventListener('click', () => {
         delayMax,
         loopMode,
         loopCount,
-        proxySource
+        proxySource,
+        countryWhitelist
     };
 
     // Include custom proxies if using custom source
@@ -289,6 +300,11 @@ startBtn.addEventListener('click', () => {
     addLog(`🌐 Target: ${urlsLabel}`, 'info');
     if (urls.length > 1) urls.forEach((u, i) => addLog(`   ${i+1}. ${u}`, 'info'));
     addLog(`⚡ Concurrency: ${concurrency} | Delay: ${delayMin}-${delayMax}ms | Mode: ${useHeadless ? 'Headless' : 'Visible'} | Proxy: ${sourceLabel}`, 'info');
+    if (countryWhitelist.length > 0) {
+        addLog(`🌍 Country Whitelist: ${countryWhitelist.join(', ')}`, 'info');
+    } else {
+        addLog(`🌍 Country Filter: All countries`, 'info');
+    }
 });
 
 // Stop button
@@ -487,6 +503,7 @@ const bgMonitorPanel = document.getElementById('bgMonitorPanel');
 const bgMonitorPulse = document.getElementById('bgMonitorPulse');
 const bgMonitorState = document.getElementById('bgMonitorState');
 const bgMonitorStopBtn = document.getElementById('bgMonitorStopBtn');
+const bgMonitorResumeBtn = document.getElementById('bgMonitorResumeBtn');
 const bgMonitorUrl = document.getElementById('bgMonitorUrl');
 const bgMonitorStarted = document.getElementById('bgMonitorStarted');
 const bgMonitorLoop = document.getElementById('bgMonitorLoop');
@@ -557,29 +574,45 @@ async function checkBgStatus() {
             }
             
         } else if (data.task) {
-            // Task finished
+            // Task finished - check if interrupted (resumable)
+            const isInterrupted = data.task.interrupted;
+            
             bgStatusBar.style.display = 'flex';
             bgStatusIndicator.className = 'bg-status-indicator stopped';
-            bgStatusText.textContent = `Completed: ✅${data.task.successCount} ❌${data.task.failCount}`;
             bgStopBtn.style.display = 'none';
             
-            // Monitor panel - show completed state
+            if (isInterrupted) {
+                bgStatusText.textContent = `⚠️ Interrupted: ✅${data.task.totalSuccessCount || data.task.successCount} ❌${data.task.totalFailCount || data.task.failCount} (Loop ${data.task.currentLoop})`;
+            } else {
+                bgStatusText.textContent = `Completed: ✅${data.task.successCount} ❌${data.task.failCount}`;
+            }
+            
+            // Monitor panel - show completed/interrupted state
             bgMonitorPanel.style.display = 'block';
-            bgMonitorPulse.className = 'bg-pulse completed';
-            bgMonitorState.textContent = '🏁 Completed';
+            bgMonitorPulse.className = isInterrupted ? 'bg-pulse stopped' : 'bg-pulse completed';
+            bgMonitorState.textContent = isInterrupted ? '⚠️ Interrupted' : '🏁 Completed';
             bgMonitorUrl.textContent = data.task.url;
             bgMonitorStarted.textContent = new Date(data.task.startedAt).toLocaleString();
             bgMonitorLoop.textContent = data.task.currentLoop;
             bgMonitorProxies.textContent = data.task.proxyCount;
-            bgMonitorSuccess.textContent = data.task.successCount;
-            bgMonitorFailed.textContent = data.task.failCount;
-            bgMonitorCompleted.textContent = data.task.completedCount;
+            bgMonitorSuccess.textContent = data.task.totalSuccessCount || data.task.successCount;
+            bgMonitorFailed.textContent = data.task.totalFailCount || data.task.failCount;
+            bgMonitorCompleted.textContent = data.task.totalCompletedCount || data.task.completedCount;
             bgMonitorTarget.textContent = data.task.totalAccess;
-            bgMonitorProgressFill.style.width = '100%';
-            bgMonitorProgressText.textContent = '100%';
+            bgMonitorProgressFill.style.width = isInterrupted ? '0%' : '100%';
+            bgMonitorProgressText.textContent = isInterrupted ? 'Paused' : '100%';
+            
+            // Show resume button if interrupted
+            if (bgMonitorResumeBtn) {
+                bgMonitorResumeBtn.style.display = isInterrupted ? 'inline-block' : 'none';
+            }
+            bgMonitorStopBtn.style.display = 'none';
         } else {
+            // No task - check for resumable state
             bgStatusBar.style.display = 'none';
             bgMonitorPanel.style.display = 'none';
+            if (bgMonitorResumeBtn) bgMonitorResumeBtn.style.display = 'none';
+            checkResumableState();
         }
     } catch (e) {
         // ignore
@@ -605,11 +638,63 @@ if (bgStopBtn) {
 if (bgMonitorStopBtn) {
     bgMonitorStopBtn.addEventListener('click', async () => {
         await fetch('/api/background/stop', { method: 'POST' });
-        addLog('⏹️ Background task stop requested', 'warning');
+        addLog('⏹️ Background task stop requested (graceful shutdown)', 'warning');
         bgMonitorPulse.className = 'bg-pulse stopped';
         bgMonitorState.textContent = '⏹️ Stopping...';
         setTimeout(checkBgStatus, 1500);
     });
+}
+
+// Background resume button (monitor panel)
+if (bgMonitorResumeBtn) {
+    bgMonitorResumeBtn.addEventListener('click', async () => {
+        bgMonitorResumeBtn.disabled = true;
+        bgMonitorResumeBtn.textContent = '⏳ Resuming...';
+        try {
+            const res = await fetch('/api/background/resume', { method: 'POST' });
+            const result = await res.json();
+            if (result.success) {
+                addLog('🔄 Background task resumed!', 'success');
+                bgMonitorResumeBtn.style.display = 'none';
+            } else {
+                addLog(`❌ Resume failed: ${result.message}`, 'error');
+            }
+        } catch (err) {
+            addLog(`❌ Resume error: ${err.message}`, 'error');
+        }
+        bgMonitorResumeBtn.disabled = false;
+        bgMonitorResumeBtn.innerHTML = '<i class="fas fa-play"></i> Resume';
+        setTimeout(checkBgStatus, 1000);
+    });
+}
+
+// Check for resumable state (shown when no task is running)
+async function checkResumableState() {
+    try {
+        const res = await fetch('/api/background/resumable');
+        const data = await res.json();
+        if (data.hasResumable && data.info) {
+            bgMonitorPanel.style.display = 'block';
+            bgMonitorPulse.className = 'bg-pulse stopped';
+            bgMonitorState.textContent = '⚠️ Interrupted (Resumable)';
+            bgMonitorUrl.textContent = data.info.url || '-';
+            bgMonitorLoop.textContent = data.info.currentLoop || '-';
+            bgMonitorSuccess.textContent = data.info.totalSuccess || 0;
+            bgMonitorFailed.textContent = data.info.totalFailed || 0;
+            bgMonitorStarted.textContent = data.info.savedAt ? new Date(data.info.savedAt).toLocaleString() : '-';
+            bgMonitorProgressFill.style.width = '0%';
+            bgMonitorProgressText.textContent = 'Paused';
+            bgMonitorStopBtn.style.display = 'none';
+            if (bgMonitorResumeBtn) bgMonitorResumeBtn.style.display = 'inline-block';
+            
+            bgStatusBar.style.display = 'flex';
+            bgStatusIndicator.className = 'bg-status-indicator stopped';
+            bgStatusText.textContent = `⚠️ Resumable: ${data.info.url} (Loop ${data.info.currentLoop})`;
+            bgStopBtn.style.display = 'none';
+        }
+    } catch (e) {
+        // ignore
+    }
 }
 
 // Listen for background events via socket
@@ -722,6 +807,9 @@ startBtn.addEventListener('click', async (e) => {
     const loopCount = loopInfinite ? -1 : (parseInt(loopCountInput.value) || 1);
     const proxySource = document.querySelector('.proxy-tab.active')?.dataset?.source || 'auto';
 
+    // Parse country whitelist for background mode
+    const countryWhitelistBg = countryWhitelistInput ? countryWhitelistInput.value.trim().split(',').map(c => c.trim()).filter(c => c) : [];
+
     const body = {
         url,
         urls,
@@ -733,7 +821,8 @@ startBtn.addEventListener('click', async (e) => {
         delayMax,
         loopMode,
         loopCount,
-        proxySource
+        proxySource,
+        countryWhitelist: countryWhitelistBg
     };
 
     if (proxySource === 'custom') {

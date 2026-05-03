@@ -126,6 +126,13 @@
                             <i class="fas fa-info-circle"></i>
                             <span>Proxies will be scraped from spys.one, free-proxy-list.net, sslproxies.org & GitHub lists. Elite/High Anonymous proxies are prioritized.</span>
                         </div>
+                        <div class="form-group" style="margin-top: 10px;">
+                            <label for="countryWhitelist">
+                                <i class="fas fa-globe-americas"></i> Country Whitelist <span class="optional-badge">(Optional)</span>
+                            </label>
+                            <input type="text" id="countryWhitelist" placeholder="e.g. US, GB, DE, FR, ID (comma separated, leave empty for all countries)">
+                            <span class="input-hint">Only use proxies from these countries. Leave empty to use all countries. Use 2-letter country codes or full names.</span>
+                        </div>
                         <div class="cache-status-bar" id="cacheStatusBar">
                             <div class="cache-status-info">
                                 <i class="fas fa-database"></i>
@@ -199,6 +206,9 @@
                             <span class="bg-pulse" id="bgMonitorPulse">●</span>
                             <span id="bgMonitorState">Idle</span>
                         </div>
+                        <button id="bgMonitorResumeBtn" class="btn btn-success btn-sm" style="display:none;">
+                            <i class="fas fa-play"></i> Resume
+                        </button>
                         <button id="bgMonitorStopBtn" class="btn btn-danger btn-sm">
                             <i class="fas fa-stop"></i> Stop Process
                         </button>

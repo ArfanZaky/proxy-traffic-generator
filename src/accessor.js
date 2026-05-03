@@ -1,6 +1,8 @@
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const https = require('https');
+const { generateFingerprint, applyFingerprint, getLaunchArgs, humanMouseMove, simulateIdleBehavior } = require('./antiDetection');
+const { globalRateLimiter } = require('./rateLimiter');
 
 // Increase max listeners to prevent warnings
 process.setMaxListeners(100);
@@ -14,6 +16,9 @@ process.setMaxListeners(100);
 async function accessWithProxy(url, proxy, useHeadless) {
   const startTime = Date.now();
 
+  // Rate limiting: wait if needed
+  await globalRateLimiter.acquire(url);
+
   if (useHeadless) {
     // Headless mode: browser hidden
     return await accessWithPuppeteer(url, proxy, startTime, true);
@@ -24,27 +29,26 @@ async function accessWithProxy(url, proxy, useHeadless) {
 }
 
 /**
- * Access URL using Puppeteer (without puppeteer-extra to avoid TargetCloseError)
+ * Access URL using Puppeteer with full anti-detection
  * @param {boolean} headless - true = hidden browser, false = visible window
  */
 async function accessWithPuppeteer(url, proxy, startTime, headless) {
   let browser = null;
   
+  // Generate unique fingerprint for this session
+  const fingerprint = generateFingerprint();
+  
   try {
     const puppeteer = require('puppeteer');
 
+    // Get anti-detection launch args based on fingerprint
+    const stealthArgs = getLaunchArgs(fingerprint);
+    
     browser = await puppeteer.launch({
       headless: headless ? 'new' : false,
       args: [
         `--proxy-server=http://${proxy.ip}:${proxy.port}`,
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--window-size=1366,768',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-blink-features=AutomationControlled'
+        ...stealthArgs,
       ],
       defaultViewport: null,
       timeout: 60000,
@@ -61,25 +65,8 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
       });
     }
     
-    // Manual stealth: override navigator.webdriver
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      window.chrome = { runtime: {} };
-    });
-
-    // Set random user agent
-    await page.setUserAgent(getRandomUserAgent());
-    
-    // Set viewport
-    await page.setViewport({ width: 1366, height: 768 });
-
-    // Set extra headers
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': getRandomAcceptLanguage(),
-      'DNT': Math.random() > 0.5 ? '1' : '0'
-    });
+    // Apply full fingerprint (user-agent, viewport, headers, stealth scripts)
+    await applyFingerprint(page, fingerprint);
 
     // Navigate to URL - wait until FULLY loaded
     const response = await page.goto(url, {
@@ -113,8 +100,10 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
 
     const title = await page.title();
 
-    // === STEP 1: Page is FULLY loaded, now wait 10 seconds ===
-    await new Promise(resolve => setTimeout(resolve, 10000));
+    // === STEP 1: Page is FULLY loaded, simulate human idle behavior ===
+    // Random wait between 5-15 seconds (more natural than fixed 10s)
+    const idleTime = 5000 + Math.floor(Math.random() * 10000);
+    await simulateIdleBehavior(page, idleTime);
 
     // === STEP 1.5: Ad clicking disabled ===
     // await detectAndClickAds(page);
@@ -122,14 +111,16 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     // === STEP 2: Scroll down to the bottom of the page ===
     await autoScroll(page, 'down');
 
-    // Small pause at the bottom
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    // Small pause at the bottom with random mouse movement
+    const pauseBottom = 1000 + Math.floor(Math.random() * 3000);
+    await simulateIdleBehavior(page, pauseBottom);
 
     // === STEP 3: Scroll back up to the top ===
     await autoScroll(page, 'up');
 
     // Small pause at the top
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const pauseTop = 500 + Math.floor(Math.random() * 1500);
+    await new Promise(resolve => setTimeout(resolve, pauseTop));
 
     const responseTime = Date.now() - startTime;
 
@@ -139,7 +130,8 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
       statusCode,
       responseTime,
       title: title || 'N/A',
-      contentLength: 'N/A (Browser mode)'
+      contentLength: 'N/A (Browser mode)',
+      fingerprint: `${fingerprint.browser}/${fingerprint.os}`
     };
   } catch (error) {
     if (browser) {
@@ -272,6 +264,9 @@ async function detectAndClickAds(page) {
       
       await new Promise(resolve => setTimeout(resolve, 1000));
 
+      // Use human-like mouse movement to click ad
+      await humanMouseMove(page, targetAd.x, targetAd.y);
+
       // Remember original URL
       const originalUrl = page.url();
       
@@ -355,15 +350,18 @@ async function detectAndClickAds(page) {
 async function autoScroll(page, direction = 'down') {
   await page.evaluate(async (dir) => {
     await new Promise((resolve) => {
-      const distance = 200 + Math.floor(Math.random() * 150);
-      const delay = 100 + Math.floor(Math.random() * 100);
+      // Randomize scroll behavior for each session
+      const distance = 150 + Math.floor(Math.random() * 200);
+      const delay = 80 + Math.floor(Math.random() * 150);
 
       if (dir === 'down') {
         let totalHeight = 0;
         const timer = setInterval(() => {
           const scrollHeight = document.body.scrollHeight;
-          window.scrollBy(0, distance);
-          totalHeight += distance;
+          // Add slight randomness to each scroll step
+          const step = distance + Math.floor(Math.random() * 50) - 25;
+          window.scrollBy(0, step);
+          totalHeight += step;
 
           if (totalHeight >= scrollHeight) {
             window.scrollTo(0, document.body.scrollHeight);
@@ -376,8 +374,9 @@ async function autoScroll(page, direction = 'down') {
         const currentPos = window.pageYOffset || document.documentElement.scrollTop;
         
         const timer = setInterval(() => {
-          window.scrollBy(0, -distance);
-          scrolled += distance;
+          const step = distance + Math.floor(Math.random() * 50) - 25;
+          window.scrollBy(0, -step);
+          scrolled += step;
 
           if (scrolled >= currentPos || window.pageYOffset <= 0) {
             window.scrollTo(0, 0);
@@ -391,52 +390,13 @@ async function autoScroll(page, direction = 'down') {
 }
 
 /**
- * Get a random User-Agent string
- */
-function getRandomUserAgent() {
-  const userAgents = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 OPR/106.0.0.0',
-    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Vivaldi/6.5'
-  ];
-  
-  return userAgents[Math.floor(Math.random() * userAgents.length)];
-}
-
-/**
- * Get random Accept-Language header
- */
-function getRandomAcceptLanguage() {
-  const languages = [
-    'en-US,en;q=0.9',
-    'en-GB,en;q=0.9',
-    'en-US,en;q=0.9,id;q=0.8',
-    'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
-    'en-US,en;q=0.9,fr;q=0.8',
-    'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-    'ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7',
-    'zh-CN,zh;q=0.9,en;q=0.8',
-    'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-    'es-ES,es;q=0.9,en;q=0.8'
-  ];
-  return languages[Math.floor(Math.random() * languages.length)];
-}
-
-/**
  * Verify a proxy by accessing a URL and checking for status 200
  * Uses a lightweight HTTP request (not full browser) for speed
  */
 async function verifyProxy(verifyUrl, proxy) {
+  // Generate fingerprint for consistent headers
+  const fingerprint = generateFingerprint();
+  
   try {
     // Build proxy URL with auth if needed
     let proxyUrl;
@@ -453,9 +413,17 @@ async function verifyProxy(verifyUrl, proxy) {
       httpsAgent: agent,
       timeout: 15000,
       headers: {
-        'User-Agent': getRandomUserAgent(),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': getRandomAcceptLanguage()
+        'User-Agent': fingerprint.userAgent,
+        'Accept': fingerprint.headers['Accept'] || 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': fingerprint.acceptLanguage,
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        ...(fingerprint.headers['sec-ch-ua'] ? {
+          'sec-ch-ua': fingerprint.headers['sec-ch-ua'],
+          'sec-ch-ua-mobile': '?0',
+          'sec-ch-ua-platform': fingerprint.headers['sec-ch-ua-platform'],
+        } : {}),
       },
       validateStatus: () => true, // Don't throw on non-2xx
       maxRedirects: 5
