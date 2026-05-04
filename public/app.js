@@ -12,6 +12,7 @@ const targetUrlInput = document.getElementById('targetUrl');
 const urlCountBadge = document.getElementById('urlCountBadge');
 const verifyUrlInput = document.getElementById('verifyUrl');
 const countryWhitelistInput = document.getElementById('countryWhitelist');
+const discordWebhookInput = document.getElementById('discordWebhook');
 const totalAccessInput = document.getElementById('totalAccess');
 const concurrencyInput = document.getElementById('concurrency');
 const headlessModeToggle = document.getElementById('headlessMode');
@@ -268,6 +269,7 @@ startBtn.addEventListener('click', () => {
 
     // Parse country whitelist
     const countryWhitelist = countryWhitelistInput ? countryWhitelistInput.value.trim().split(',').map(c => c.trim()).filter(c => c) : [];
+    const discordWebhook = discordWebhookInput ? discordWebhookInput.value.trim() : '';
 
     // Emit start event
     const emitData = {
@@ -282,7 +284,8 @@ startBtn.addEventListener('click', () => {
         loopMode,
         loopCount,
         proxySource,
-        countryWhitelist
+        countryWhitelist,
+        discordWebhook
     };
 
     // Include custom proxies if using custom source
@@ -809,6 +812,7 @@ startBtn.addEventListener('click', async (e) => {
 
     // Parse country whitelist for background mode
     const countryWhitelistBg = countryWhitelistInput ? countryWhitelistInput.value.trim().split(',').map(c => c.trim()).filter(c => c) : [];
+    const discordWebhookBg = discordWebhookInput ? discordWebhookInput.value.trim() : '';
 
     const body = {
         url,
@@ -822,7 +826,8 @@ startBtn.addEventListener('click', async (e) => {
         loopMode,
         loopCount,
         proxySource,
-        countryWhitelist: countryWhitelistBg
+        countryWhitelist: countryWhitelistBg,
+        discordWebhook: discordWebhookBg
     };
 
     if (proxySource === 'custom') {

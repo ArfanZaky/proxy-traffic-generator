@@ -10,6 +10,7 @@ const { accessWithProxy, verifyProxy } = require('./src/accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./src/proxyHistory');
 const { getProxies: getCachedProxies, getCacheStats, clearCache: clearProxyCache } = require('./src/proxyCache');
 const { filterProxiesByCountry } = require('./src/countryFilter');
+const { sendDiscordNotification } = require('./src/discordNotifier');
 const BackgroundTaskManager = require('./src/backgroundTask');
 
 const app = express();
@@ -142,7 +143,7 @@ io.on('connection', (socket) => {
   activeConnections.set(socket.id, { running: false });
 
   socket.on('start-access', async (data) => {
-    const { url, urls: rawUrls, verifyUrl = '', totalAccess, useHeadless, concurrency = 5, delayMin = 500, delayMax = 2000, loopMode = false, loopCount = 1, proxySource = 'auto', customProxies = '', countryWhitelist = [] } = data;
+    const { url, urls: rawUrls, verifyUrl = '', totalAccess, useHeadless, concurrency = 5, delayMin = 500, delayMax = 2000, loopMode = false, loopCount = 1, proxySource = 'auto', customProxies = '', countryWhitelist = [], discordWebhook = '' } = data;
     
     // Support multiple URLs - use urls array if provided, otherwise fall back to single url
     const urls = (rawUrls && rawUrls.length > 0) ? rawUrls : (url ? [url] : []);
@@ -155,6 +156,7 @@ io.on('connection', (socket) => {
 
     isRunning = true;
     activeConnections.set(socket.id, { running: true });
+    const taskStartTime = Date.now();
 
     const isInfinite = loopMode && loopCount === -1;
     const totalLoops = isInfinite ? Infinity : (loopMode ? loopCount : 1);
@@ -472,6 +474,22 @@ io.on('connection', (socket) => {
         socket.emit('log', { message: `⏳ Waiting 3s before next loop...` });
         await new Promise(resolve => setTimeout(resolve, 3000));
       }
+    }
+
+    // Send Discord notification on task complete
+    if (discordWebhook) {
+      const duration = Date.now() - taskStartTime;
+      sendDiscordNotification(discordWebhook, {
+        successCount: totalSuccessCount || successCount,
+        failCount: totalFailCount || failCount,
+        total: totalCompletedCount || completedCount,
+        url: primaryUrl,
+        urls,
+        duration,
+        mode: 'normal'
+      }).then(sent => {
+        if (sent) socket.emit('log', { message: '📨 Discord notification sent!' });
+      }).catch(() => {});
     }
 
     isRunning = false;

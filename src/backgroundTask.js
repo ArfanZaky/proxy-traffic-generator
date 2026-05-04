@@ -3,6 +3,7 @@ const { accessWithProxy, verifyProxy } = require('./accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./proxyHistory');
 const { getProxies: getCachedProxies, clearCache: clearProxyCache } = require('./proxyCache');
 const { filterProxiesByCountry } = require('./countryFilter');
+const { sendDiscordNotification } = require('./discordNotifier');
 const fs = require('fs');
 const path = require('path');
 
@@ -262,7 +263,8 @@ class BackgroundTaskManager {
       loopCount = 1,
       proxySource = 'auto',
       customProxies = '',
-      countryWhitelist = []
+      countryWhitelist = [],
+      discordWebhook = ''
     } = config;
 
     // Support multiple URLs
@@ -339,7 +341,8 @@ class BackgroundTaskManager {
       loopCount = 1,
       proxySource = 'auto',
       customProxies = '',
-      countryWhitelist = []
+      countryWhitelist = [],
+      discordWebhook = ''
     } = config;
 
     // Multiple URL support
@@ -624,6 +627,22 @@ class BackgroundTaskManager {
       totalFailed: this.task.totalFailCount,
       totalCompleted: this.task.totalCompletedCount
     });
+
+    // Send Discord notification on task complete
+    if (discordWebhook) {
+      const duration = this.task.startedAt ? Date.now() - new Date(this.task.startedAt).getTime() : 0;
+      sendDiscordNotification(discordWebhook, {
+        successCount: this.task.totalSuccessCount || this.task.successCount,
+        failCount: this.task.totalFailCount || this.task.failCount,
+        total: this.task.totalCompletedCount || totalAccess,
+        url: primaryUrl,
+        urls,
+        duration,
+        mode: 'background'
+      }).then(sent => {
+        if (sent) this.addLog('📨 Discord notification sent!');
+      }).catch(() => {});
+    }
 
     // Clean up state file on normal completion
     try { fs.unlinkSync(STATE_FILE); } catch(e) {}
