@@ -2,9 +2,11 @@
  * Proxy Cache Module
  * Caches scraped proxies with TTL to avoid re-scraping on every loop.
  * Smart refresh: only re-scrape when cache expires or success rate drops.
+ * Enhanced: Removes dead proxies on connection failure, tracks removal stats.
  */
 
 const { scrapeProxies } = require('./proxyScraper');
+const { batchValidateProxies } = require('./proxyValidator');
 
 // Cache state
 let cachedProxies = [];
@@ -108,7 +110,92 @@ async function getProxies(options = {}) {
 function removeFromCache(proxyIp, proxyPort) {
   const before = cachedProxies.length;
   cachedProxies = cachedProxies.filter(p => !(p.ip === proxyIp && p.port === String(proxyPort)));
-  return before - cachedProxies.length; // number removed
+  const removed = before - cachedProxies.length;
+  if (removed > 0) {
+    cacheStats.removedDead = (cacheStats.removedDead || 0) + removed;
+  }
+  return removed;
+}
+
+/**
+ * Get validated proxies - scrape/cache + TCP validation
+ * This ensures only reachable proxies are returned, dramatically reducing
+ * ERR_PROXY_CONNECTION_FAILED errors.
+ *
+ * @param {object} options - Same as getProxies() plus validation options
+ * @param {boolean} options.validate - Whether to run TCP validation (default: true)
+ * @param {number} options.maxValid - Max proxies to validate (default: 50, 0 = all)
+ * @param {number} options.tcpTimeout - TCP check timeout ms (default: 4000)
+ * @param {function} options.onValidationProgress - Progress callback
+ * @returns {Object} { proxies, fromCache, validated, stats }
+ */
+async function getValidatedProxies(options = {}) {
+  const {
+    validate = true,
+    maxValid = 50,
+    tcpTimeout = 4000,
+    onValidationProgress = null,
+    ...cacheOptions
+  } = options;
+
+  // First get proxies from cache/scrape
+  const cacheResult = await getProxies(cacheOptions);
+  
+  if (!validate || cacheResult.proxies.length === 0) {
+    return { ...cacheResult, validated: false, validationStats: null };
+  }
+
+  // Run batch validation with HTTP CONNECT test
+  // TCP-only validation is insufficient - many proxies accept TCP but refuse HTTPS tunneling
+  const validationResult = await batchValidateProxies(cacheResult.proxies, {
+    concurrency: 30,
+    maxValid,
+    tcpTimeout,
+    doConnectTest: true,  // Actually verify HTTPS CONNECT tunneling works
+    onProgress: onValidationProgress
+  });
+
+  console.log(`Proxy validation: ${validationResult.stats.validCount}/${validationResult.stats.total} reachable (avg latency: ${validationResult.stats.avgLatencyMs}ms)`);
+
+  // === CRITICAL FALLBACK ===
+  // If TCP validation rejected ALL proxies, DON'T return empty array.
+  // Instead, return the original unvalidated proxies so the system can still function.
+  // The browser-level attempt will be the real test (TCP probes may be blocked by firewall).
+  if (validationResult.valid.length === 0 && cacheResult.proxies.length > 0) {
+    console.log(`⚠️ TCP validation rejected ALL ${cacheResult.proxies.length} proxies - FALLBACK: using unvalidated proxies`);
+    console.log(`   (This usually means the local firewall blocks outbound TCP probes to non-standard ports)`);
+    console.log(`   (The browser may still be able to connect through these proxies)`);
+    
+    // Return original proxies without removing any from cache
+    return {
+      proxies: cacheResult.proxies,
+      fromCache: cacheResult.fromCache,
+      cacheAge: cacheResult.cacheAge,
+      totalScraped: cacheResult.totalScraped,
+      validated: true,
+      validationSkipped: true,
+      validationStats: {
+        ...validationResult.stats,
+        fallbackUsed: true,
+        fallbackReason: 'all_proxies_failed_tcp_check'
+      }
+    };
+  }
+
+  // Normal case: some proxies passed validation
+  // Remove invalid proxies from cache (only when we have valid ones to use)
+  for (const { proxy } of validationResult.invalid) {
+    removeFromCache(proxy.ip, proxy.port);
+  }
+
+  return {
+    proxies: validationResult.valid,
+    fromCache: cacheResult.fromCache,
+    cacheAge: cacheResult.cacheAge,
+    totalScraped: cacheResult.totalScraped,
+    validated: true,
+    validationStats: validationResult.stats
+  };
 }
 
 /**
@@ -121,7 +208,8 @@ function getCacheStats() {
     cacheAge: getCacheAge(),
     isValid: isCacheValid(),
     ttlMs: DEFAULT_TTL_MS,
-    ttlRemaining: cacheTimestamp ? Math.max(0, DEFAULT_TTL_MS - (Date.now() - cacheTimestamp)) : 0
+    ttlRemaining: cacheTimestamp ? Math.max(0, DEFAULT_TTL_MS - (Date.now() - cacheTimestamp)) : 0,
+    removedDead: cacheStats.removedDead || 0
   };
 }
 
@@ -143,6 +231,7 @@ function getCachedCount() {
 
 module.exports = {
   getProxies,
+  getValidatedProxies,
   removeFromCache,
   getCacheStats,
   clearCache,

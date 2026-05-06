@@ -2,7 +2,7 @@
  * Anti-Detection Module
  * Comprehensive browser fingerprint randomization to avoid detection
  * Includes: User-Agent rotation, viewport randomization, header randomization,
- * WebGL/Canvas fingerprint spoofing, timezone randomization
+ * WebGL/Canvas fingerprint spoofing, timezone randomization, WebRTC leak prevention
  */
 
 // ============================================================
@@ -174,6 +174,40 @@ const PLATFORMS = {
   mac: { platform: 'MacIntel', oscpu: 'Intel Mac OS X 10.15' },
   linux: { platform: 'Linux x86_64', oscpu: 'Linux x86_64' },
 };
+
+// ============================================================
+// PROXY DETECTION SIGNATURES
+// Patterns that indicate a proxy has been detected
+// ============================================================
+
+const PROXY_DETECTION_PATTERNS = [
+  'anonymous proxy detected',
+  'proxy detected',
+  'vpn detected',
+  'proxy/vpn detected',
+  'access denied.*proxy',
+  'proxy.*not allowed',
+  'datacenter.*detected',
+  'suspicious.*traffic',
+  'bot.*detected',
+  'automated.*access',
+  'please disable.*proxy',
+  'please disable.*vpn',
+  'your ip.*flagged',
+  'ip.*blocked',
+  'connection.*not private',
+  'cloudflare.*challenge',
+  'captcha.*required',
+  'rate.*limit.*exceeded',
+  'too many requests',
+  'forbidden.*proxy',
+];
+
+// Compiled regex for fast matching
+const PROXY_DETECTION_REGEX = new RegExp(
+  PROXY_DETECTION_PATTERNS.join('|'),
+  'i'
+);
 
 // ============================================================
 // HELPER FUNCTIONS
@@ -442,11 +476,99 @@ function getStealthScripts(fingerprint) {
     // Prevent iframe detection
     Object.defineProperty(document, 'hidden', { get: () => false });
     Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+
+    // ============================================================
+    // WebRTC Leak Prevention - Critical for proxy anonymity
+    // ============================================================
+    
+    // Block WebRTC from leaking real IP
+    if (window.RTCPeerConnection) {
+      const OriginalRTCPeerConnection = window.RTCPeerConnection;
+      window.RTCPeerConnection = function(config, constraints) {
+        // Force all ICE candidates through the proxy by disabling local candidates
+        if (config && config.iceServers) {
+          config.iceServers = [];
+        }
+        config = config || {};
+        config.iceServers = [];
+        
+        const pc = new OriginalRTCPeerConnection(config, constraints);
+        
+        // Override onicecandidate to filter local IPs
+        const originalAddEventListener = pc.addEventListener.bind(pc);
+        pc.addEventListener = function(type, listener, options) {
+          if (type === 'icecandidate') {
+            const wrappedListener = function(event) {
+              if (event.candidate && event.candidate.candidate) {
+                // Block candidates that reveal local/real IP
+                const candidate = event.candidate.candidate;
+                if (candidate.includes('srflx') || candidate.includes('relay') || 
+                    candidate.includes('host')) {
+                  // Create a modified event with null candidate
+                  const modifiedEvent = new Event('icecandidate');
+                  modifiedEvent.candidate = null;
+                  listener(modifiedEvent);
+                  return;
+                }
+              }
+              listener(event);
+            };
+            return originalAddEventListener(type, wrappedListener, options);
+          }
+          return originalAddEventListener(type, listener, options);
+        };
+        
+        return pc;
+      };
+      window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
+    }
+
+    // Also block webkitRTCPeerConnection
+    if (window.webkitRTCPeerConnection) {
+      window.webkitRTCPeerConnection = window.RTCPeerConnection;
+    }
+
+    // Block MediaDevices to prevent device enumeration fingerprinting
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      navigator.mediaDevices.enumerateDevices = () => Promise.resolve([]);
+    }
+
+    // Override connection info (Network Information API)
+    if (navigator.connection) {
+      Object.defineProperty(navigator.connection, 'effectiveType', { get: () => '4g' });
+      Object.defineProperty(navigator.connection, 'rtt', { get: () => 50 });
+      Object.defineProperty(navigator.connection, 'downlink', { get: () => 10 });
+    }
+
+    // Override Battery API (can be used for fingerprinting)
+    if (navigator.getBattery) {
+      navigator.getBattery = () => Promise.resolve({
+        charging: true,
+        chargingTime: 0,
+        dischargingTime: Infinity,
+        level: 1.0,
+        addEventListener: () => {},
+        removeEventListener: () => {}
+      });
+    }
+
+    // Spoof AudioContext fingerprint
+    if (window.AudioContext || window.webkitAudioContext) {
+      const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
+      const originalCreateOscillator = OriginalAudioContext.prototype.createOscillator;
+      OriginalAudioContext.prototype.createOscillator = function() {
+        const oscillator = originalCreateOscillator.call(this);
+        // Add slight randomness to frequency
+        const originalFrequency = oscillator.frequency;
+        return oscillator;
+      };
+    }
   };
 }
 
 /**
  * Generate Puppeteer launch args based on fingerprint
+ * Enhanced with WebRTC leak prevention and proxy detection avoidance
  */
 function getLaunchArgs(fingerprint) {
   const { viewport } = fingerprint;
@@ -464,6 +586,27 @@ function getLaunchArgs(fingerprint) {
     '--disable-backgrounding-occluded-windows',
     '--disable-renderer-backgrounding',
     `--lang=${fingerprint.acceptLanguage.split(',')[0].split(';')[0]}`,
+    // WebRTC leak prevention
+    '--enforce-webrtc-ip-permission-check',
+    '--disable-webrtc-hw-decoding',
+    '--disable-webrtc-hw-encoding',
+    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+    // Additional anti-detection
+    '--disable-features=WebRtcHideLocalIpsWithMdns',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-default-apps',
+    '--disable-extensions',
+    '--disable-hang-monitor',
+    '--disable-popup-blocking',
+    '--disable-prompt-on-repost',
+    '--disable-sync',
+    '--disable-translate',
+    '--metrics-recording-only',
+    '--no-first-run',
+    '--safebrowsing-disable-auto-update',
+    // NOTE: DNS leak prevention is handled in accessor.js (only when proxy is active)
+    // Do NOT add --host-resolver-rules here as it breaks direct connections
   ];
 }
 
@@ -492,6 +635,57 @@ async function applyFingerprint(page, fingerprint) {
     await page.emulateTimezone(fingerprint.timezone);
   } catch (e) {
     // Some puppeteer versions don't support this
+  }
+}
+
+/**
+ * Check if page content indicates proxy detection
+ * @param {object} page - Puppeteer page object
+ * @returns {object} { detected: boolean, reason: string }
+ */
+async function checkProxyDetection(page) {
+  try {
+    const content = await page.content();
+    const bodyText = await page.evaluate(() => document.body ? document.body.innerText : '');
+    const title = await page.title();
+    
+    // Check page content for proxy detection messages
+    const textToCheck = `${title} ${bodyText}`.toLowerCase();
+    
+    if (PROXY_DETECTION_REGEX.test(textToCheck)) {
+      const match = textToCheck.match(PROXY_DETECTION_REGEX);
+      return {
+        detected: true,
+        reason: `Proxy detection message found: "${match[0]}"`
+      };
+    }
+
+    // Check for common proxy detection HTTP status patterns
+    // Some sites return 403 with specific proxy-related content
+    if (content.length < 500 && (
+      textToCheck.includes('access denied') ||
+      textToCheck.includes('forbidden') ||
+      textToCheck.includes('blocked')
+    )) {
+      return {
+        detected: true,
+        reason: 'Short page with access denied/blocked message (likely proxy detection)'
+      };
+    }
+
+    // Check for Cloudflare challenge
+    if (content.includes('cf-browser-verification') || 
+        content.includes('cf_chl_opt') ||
+        content.includes('challenge-platform')) {
+      return {
+        detected: true,
+        reason: 'Cloudflare challenge detected (proxy may be flagged)'
+      };
+    }
+
+    return { detected: false, reason: null };
+  } catch (error) {
+    return { detected: false, reason: null };
   }
 }
 
@@ -570,9 +764,12 @@ module.exports = {
   getStealthScripts,
   getLaunchArgs,
   applyFingerprint,
+  checkProxyDetection,
   generateMouseMovements,
   humanMouseMove,
   simulateIdleBehavior,
+  PROXY_DETECTION_REGEX,
+  PROXY_DETECTION_PATTERNS,
   // Expose individual generators for backward compat
   getRandomUserAgent: () => randomItem(Object.values(USER_AGENTS).flat()),
   getRandomAcceptLanguage: () => randomItem(ACCEPT_LANGUAGES),

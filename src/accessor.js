@@ -1,20 +1,128 @@
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+const { SocksProxyAgent } = require('socks-proxy-agent');
 const https = require('https');
-const { generateFingerprint, applyFingerprint, getLaunchArgs, humanMouseMove, simulateIdleBehavior } = require('./antiDetection');
+const { generateFingerprint, applyFingerprint, getLaunchArgs, humanMouseMove, simulateIdleBehavior, checkProxyDetection, PROXY_DETECTION_REGEX } = require('./antiDetection');
 const { globalRateLimiter } = require('./rateLimiter');
+const { quickCheck, invalidateProxy, getProxyServerArg } = require('./proxyValidator');
 
 // Increase max listeners to prevent warnings
 process.setMaxListeners(100);
 
+// ============================================================
+// PROXY QUALITY TRACKER
+// Tracks proxy detection events to blacklist bad proxies
+// ============================================================
+
+const proxyBlacklist = new Map(); // ip:port -> { detectedCount, lastDetected, reason }
+const BLACKLIST_THRESHOLD = 2;    // Blacklist after 2 detections
+const BLACKLIST_TTL_MS = 30 * 60 * 1000; // 30 minutes blacklist duration
+
 /**
- * Access a URL using a proxy
- * @param {string} url - Target URL to access
- * @param {object} proxy - Proxy object {ip, port, type}
- * @param {boolean} useHeadless - true = headless (hidden), false = visible browser window
+ * Check if a proxy is blacklisted
  */
-async function accessWithProxy(url, proxy, useHeadless) {
+function isProxyBlacklisted(proxy) {
+  const key = `${proxy.ip}:${proxy.port}`;
+  const entry = proxyBlacklist.get(key);
+  if (!entry) return false;
+  
+  // Check if blacklist has expired
+  if (Date.now() - entry.lastDetected > BLACKLIST_TTL_MS) {
+    proxyBlacklist.delete(key);
+    return false;
+  }
+  
+  return entry.detectedCount >= BLACKLIST_THRESHOLD;
+}
+
+/**
+ * Record a proxy detection event
+ */
+function recordProxyDetection(proxy, reason) {
+  const key = `${proxy.ip}:${proxy.port}`;
+  const entry = proxyBlacklist.get(key) || { detectedCount: 0, lastDetected: 0, reason: '' };
+  entry.detectedCount++;
+  entry.lastDetected = Date.now();
+  entry.reason = reason;
+  proxyBlacklist.set(key, entry);
+  
+  console.log(`  ⚠️ Proxy ${key} detected (${entry.detectedCount}x): ${reason}`);
+  if (entry.detectedCount >= BLACKLIST_THRESHOLD) {
+    console.log(`  🚫 Proxy ${key} BLACKLISTED for ${BLACKLIST_TTL_MS / 60000} minutes`);
+  }
+}
+
+/**
+ * Get blacklist stats
+ */
+function getBlacklistStats() {
+  const now = Date.now();
+  let active = 0;
+  let expired = 0;
+  
+  for (const [key, entry] of proxyBlacklist) {
+    if (now - entry.lastDetected > BLACKLIST_TTL_MS) {
+      expired++;
+    } else if (entry.detectedCount >= BLACKLIST_THRESHOLD) {
+      active++;
+    }
+  }
+  
+  return { total: proxyBlacklist.size, active, expired };
+}
+
+/**
+ * Filter out blacklisted proxies from a list
+ */
+function filterBlacklistedProxies(proxies) {
+  const before = proxies.length;
+  const filtered = proxies.filter(p => !isProxyBlacklisted(p));
+  const removed = before - filtered.length;
+  
+  if (removed > 0) {
+    console.log(`  🚫 Filtered ${removed} blacklisted proxies (${filtered.length} remaining)`);
+  }
+  
+  return filtered;
+}
+
+/**
+ * Access a URL using a proxy (or direct connection if proxy is null)
+ * @param {string} url - Target URL to access
+ * @param {object|null} proxy - Proxy object {ip, port, type} or null for direct connection
+ * @param {boolean} useHeadless - true = headless (hidden), false = visible browser window
+ * @param {object} options - Additional options
+ * @param {boolean} options.skipTCPCheck - Skip TCP pre-check (default: false)
+ */
+async function accessWithProxy(url, proxy, useHeadless, options = {}) {
   const startTime = Date.now();
+  const { skipTCPCheck = false } = options;
+
+  // === DIRECT CONNECTION MODE (no proxy) ===
+  if (!proxy) {
+    console.log(`  🌐 Direct connection (no proxy) to: ${url}`);
+    await globalRateLimiter.acquire(url);
+    return await accessWithPuppeteer(url, null, startTime, useHeadless === undefined ? true : useHeadless);
+  }
+
+  // Check if proxy is blacklisted
+  if (isProxyBlacklisted(proxy)) {
+    throw new Error(`Proxy ${proxy.ip}:${proxy.port} is blacklisted (proxy detected)`);
+  }
+
+  // === PRE-CHECK: Fast TCP connectivity test ===
+  // Non-blocking: if TCP check fails, log warning but still try the proxy
+  // (some firewalls block raw TCP but the proxy may still work via browser)
+  if (!skipTCPCheck) {
+    const isReachable = await quickCheck(proxy);
+    if (!isReachable) {
+      // DON'T reject immediately - just log a warning
+      // The proxy might still work (some environments block raw TCP probes)
+      console.log(`  ⚠️ TCP pre-check failed for ${proxy.ip}:${proxy.port} - will try anyway (browser may succeed)`);
+      // Note: We no longer call invalidateProxy() here to avoid poisoning the cache
+      // The browser attempt will be the real test
+    }
+  }
 
   // Rate limiting: wait if needed
   await globalRateLimiter.acquire(url);
@@ -29,7 +137,15 @@ async function accessWithProxy(url, proxy, useHeadless) {
 }
 
 /**
- * Access URL using Puppeteer with full anti-detection
+ * Access a URL with direct connection (no proxy) - convenience wrapper
+ * Used as fallback when all proxies fail
+ */
+async function accessDirect(url, useHeadless = true) {
+  return await accessWithProxy(url, null, useHeadless, { skipTCPCheck: true });
+}
+
+/**
+ * Access URL using Puppeteer-Extra with Stealth Plugin for full anti-detection
  * @param {boolean} headless - true = hidden browser, false = visible window
  */
 async function accessWithPuppeteer(url, proxy, startTime, headless) {
@@ -39,17 +155,33 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
   const fingerprint = generateFingerprint();
   
   try {
-    const puppeteer = require('puppeteer');
+    // Use puppeteer-extra with stealth plugin for better anti-detection
+    let puppeteer;
+    try {
+      puppeteer = require('puppeteer-extra');
+      const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+      puppeteer.use(StealthPlugin());
+    } catch (e) {
+      // Fallback to regular puppeteer if puppeteer-extra not available
+      console.log('  ⚠️ puppeteer-extra not available, using regular puppeteer');
+      puppeteer = require('puppeteer');
+    }
 
     // Get anti-detection launch args based on fingerprint
     const stealthArgs = getLaunchArgs(fingerprint);
     
+    // Build launch args - include proxy only if proxy is provided
+    const launchArgs = [...stealthArgs];
+    if (proxy) {
+      const proxyServerArg = getProxyServerArg(proxy);
+      launchArgs.unshift(`--proxy-server=${proxyServerArg}`);
+      // Chrome already routes DNS through the proxy for HTTPS (via CONNECT tunnel)
+      // Do NOT use --host-resolver-rules as it breaks DNS resolution
+    }
+    
     browser = await puppeteer.launch({
       headless: headless ? 'new' : false,
-      args: [
-        `--proxy-server=http://${proxy.ip}:${proxy.port}`,
-        ...stealthArgs,
-      ],
+      args: launchArgs,
       defaultViewport: null,
       timeout: 60000,
       ignoreDefaultArgs: ['--enable-automation']
@@ -58,7 +190,7 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     const page = await browser.newPage();
 
     // Authenticate proxy if username/password provided
-    if (proxy.username && proxy.password) {
+    if (proxy && proxy.username && proxy.password) {
       await page.authenticate({
         username: proxy.username,
         password: proxy.password
@@ -68,13 +200,37 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     // Apply full fingerprint (user-agent, viewport, headers, stealth scripts)
     await applyFingerprint(page, fingerprint);
 
-    // Navigate to URL - wait until FULLY loaded
+    // Block WebRTC at the CDP level for extra protection
+    try {
+      const client = await page.target().createCDPSession();
+      await client.send('Network.setBypassServiceWorker', { bypass: true });
+      // Disable WebRTC via CDP
+      await client.send('Emulation.setHardwareConcurrencyOverride', { 
+        hardwareConcurrency: fingerprint.hardwareConcurrency 
+      });
+    } catch (e) {
+      // CDP commands may not be available in all versions
+    }
+
+    // Navigate to URL - use domcontentloaded for reliability with proxies
+    // networkidle2 causes timeouts with slow proxy connections
+    // The page content is loaded when DOM is ready; we do our own resource waiting below
     const response = await page.goto(url, {
-      waitUntil: ['load', 'networkidle0'],
-      timeout: 60000
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
     });
 
     const statusCode = response ? response.status() : 0;
+
+    // === CHECK FOR PROXY DETECTION ===
+    const detectionResult = await checkProxyDetection(page);
+    if (detectionResult.detected) {
+      // Record this proxy as detected
+      recordProxyDetection(proxy, detectionResult.reason);
+      
+      await browser.close();
+      throw new Error(`PROXY_DETECTED: ${detectionResult.reason}`);
+    }
 
     // Wait for all images and resources to be fully loaded
     await page.evaluate(async () => {
@@ -99,6 +255,14 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     });
 
     const title = await page.title();
+
+    // === SECOND CHECK: After full load, check again for delayed proxy detection ===
+    const detectionResult2 = await checkProxyDetection(page);
+    if (detectionResult2.detected) {
+      recordProxyDetection(proxy, detectionResult2.reason);
+      await browser.close();
+      throw new Error(`PROXY_DETECTED: ${detectionResult2.reason}`);
+    }
 
     // === STEP 1: Page is FULLY loaded, simulate human idle behavior ===
     // Random wait between 5-15 seconds (more natural than fixed 10s)
@@ -137,7 +301,21 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     if (browser) {
       try { await browser.close(); } catch(e) {}
     }
-    throw new Error(`Browser: ${error.message.substring(0, 100)}`);
+    
+    // Specifically handle proxy connection failures - invalidate the proxy
+    const errMsg = error.message || '';
+    if (errMsg.includes('ERR_PROXY_CONNECTION_FAILED') ||
+        errMsg.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
+        errMsg.includes('ERR_PROXY_CERTIFICATE_INVALID') ||
+        errMsg.includes('ERR_SOCKS_CONNECTION_FAILED') ||
+        errMsg.includes('ERR_CONNECTION_RESET') ||
+        errMsg.includes('ERR_CONNECTION_REFUSED') ||
+        errMsg.includes('ERR_CONNECTION_TIMED_OUT')) {
+      // Mark this proxy as dead in the validation cache
+      invalidateProxy(proxy);
+    }
+    
+    throw new Error(`Browser: ${error.message.substring(0, 150)}`);
   }
 }
 
@@ -391,27 +569,62 @@ async function autoScroll(page, direction = 'down') {
 
 /**
  * Verify a proxy by accessing a URL and checking for status 200
+ * Also checks for proxy detection messages in the response
  * Uses a lightweight HTTP request (not full browser) for speed
  */
 async function verifyProxy(verifyUrl, proxy) {
+  // Check blacklist first
+  if (isProxyBlacklisted(proxy)) {
+    return {
+      success: false,
+      statusCode: 0,
+      error: 'Proxy is blacklisted (previously detected)',
+      proxyDetected: true
+    };
+  }
+
+  // Quick TCP pre-check before attempting HTTP request
+  // Non-blocking: log warning but still attempt the HTTP request
+  const isReachable = await quickCheck(proxy);
+  if (!isReachable) {
+    console.log(`  ⚠️ TCP pre-check failed for ${proxy.ip}:${proxy.port} during verify - will try HTTP anyway`);
+    // Don't invalidate or return failure - let the actual HTTP request be the judge
+    // Some environments block raw TCP probes but HTTP through proxy still works
+  }
+
   // Generate fingerprint for consistent headers
   const fingerprint = generateFingerprint();
   
   try {
-    // Build proxy URL with auth if needed
-    let proxyUrl;
-    if (proxy.username && proxy.password) {
-      proxyUrl = `http://${proxy.username}:${proxy.password}@${proxy.ip}:${proxy.port}`;
+    // Build proxy agent based on proxy type (HTTP vs SOCKS5)
+    let agent;
+    const proxyType = (proxy.type || 'HTTP').toUpperCase();
+    
+    if (proxyType === 'SOCKS5' || proxyType === 'SOCKS' || proxyType === 'SOCKS4') {
+      // Use SOCKS proxy agent for SOCKS proxies
+      let socksUrl;
+      const protocol = proxyType === 'SOCKS4' ? 'socks4' : 'socks5';
+      if (proxy.username && proxy.password) {
+        socksUrl = `${protocol}://${proxy.username}:${proxy.password}@${proxy.ip}:${proxy.port}`;
+      } else {
+        socksUrl = `${protocol}://${proxy.ip}:${proxy.port}`;
+      }
+      agent = new SocksProxyAgent(socksUrl);
     } else {
-      proxyUrl = `http://${proxy.ip}:${proxy.port}`;
+      // Use HTTPS proxy agent for HTTP/HTTPS proxies
+      let proxyUrl;
+      if (proxy.username && proxy.password) {
+        proxyUrl = `http://${proxy.username}:${proxy.password}@${proxy.ip}:${proxy.port}`;
+      } else {
+        proxyUrl = `http://${proxy.ip}:${proxy.port}`;
+      }
+      agent = new HttpsProxyAgent(proxyUrl);
     }
-
-    const agent = new HttpsProxyAgent(proxyUrl);
     
     const response = await axios.get(verifyUrl, {
       httpAgent: agent,
       httpsAgent: agent,
-      timeout: 15000,
+      timeout: 10000, // Reduced from 15s to 10s - if proxy is slow, it's not useful
       headers: {
         'User-Agent': fingerprint.userAgent,
         'Accept': fingerprint.headers['Accept'] || 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -429,17 +642,48 @@ async function verifyProxy(verifyUrl, proxy) {
       maxRedirects: 5
     });
 
+    // Check response body for proxy detection messages
+    const responseText = typeof response.data === 'string' ? response.data : '';
+    if (PROXY_DETECTION_REGEX.test(responseText.toLowerCase())) {
+      const match = responseText.toLowerCase().match(PROXY_DETECTION_REGEX);
+      recordProxyDetection(proxy, `Verify: ${match[0]}`);
+      return {
+        success: false,
+        statusCode: response.status,
+        error: `Proxy detected during verification: ${match[0]}`,
+        proxyDetected: true
+      };
+    }
+
     return {
       success: response.status === 200,
-      statusCode: response.status
+      statusCode: response.status,
+      proxyDetected: false
     };
   } catch (error) {
+    // Invalidate proxy on connection errors
+    const errMsg = error.message || '';
+    if (errMsg.includes('ECONNREFUSED') || errMsg.includes('ETIMEDOUT') ||
+        errMsg.includes('ECONNRESET') || errMsg.includes('socket hang up') ||
+        errMsg.includes('EHOSTUNREACH') || errMsg.includes('ENETUNREACH')) {
+      invalidateProxy(proxy);
+    }
+    
     return {
       success: false,
       statusCode: 0,
-      error: error.message
+      error: error.message,
+      proxyDetected: false
     };
   }
 }
 
-module.exports = { accessWithProxy, verifyProxy };
+module.exports = {
+  accessWithProxy,
+  accessDirect,
+  verifyProxy,
+  isProxyBlacklisted,
+  filterBlacklistedProxies,
+  getBlacklistStats,
+  recordProxyDetection
+};

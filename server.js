@@ -6,11 +6,12 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 const { scrapeProxies, parseCustomProxies } = require('./src/proxyScraper');
-const { accessWithProxy, verifyProxy } = require('./src/accessor');
+const { accessWithProxy, accessDirect, verifyProxy } = require('./src/accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./src/proxyHistory');
-const { getProxies: getCachedProxies, getCacheStats, clearCache: clearProxyCache } = require('./src/proxyCache');
+const { getProxies: getCachedProxies, getValidatedProxies, getCacheStats, clearCache: clearProxyCache, removeFromCache } = require('./src/proxyCache');
 const { filterProxiesByCountry } = require('./src/countryFilter');
 const { sendDiscordNotification } = require('./src/discordNotifier');
+const { invalidateProxy, getValidationCacheStats } = require('./src/proxyValidator');
 const BackgroundTaskManager = require('./src/backgroundTask');
 
 const app = express();
@@ -101,7 +102,10 @@ app.get('/api/background/resumable', (req, res) => {
 
 // === PROXY CACHE API ===
 app.get('/api/cache/status', (req, res) => {
-  res.json(getCacheStats());
+  res.json({
+    cache: getCacheStats(),
+    validation: getValidationCacheStats()
+  });
 });
 
 app.post('/api/cache/clear', (req, res) => {
@@ -196,22 +200,44 @@ io.on('connection', (socket) => {
           
           socket.emit('log', { message: `✅ Loaded ${proxies.length} custom proxies` });
         } else {
-          // Auto-scrape proxies (with caching)
-          socket.emit('log', { message: '🔄 Loading proxies (cached or fresh scrape)...' });
+          // Auto-scrape proxies (with caching + TCP validation)
+          socket.emit('log', { message: '🔄 Loading proxies (cached or fresh scrape + TCP validation)...' });
           
-          const cacheResult = await getCachedProxies();
+          const cacheResult = await getValidatedProxies({
+            maxValid: 60,
+            tcpTimeout: 4000,
+            onValidationProgress: (validated, total, validCount) => {
+              if (validated % 25 === 0 || validated === total) {
+                socket.emit('log', { message: `  🔍 Validating: ${validated}/${total} checked, ${validCount} reachable` });
+              }
+            }
+          });
           const allProxies = cacheResult.proxies;
           
           if (cacheResult.fromCache) {
-            socket.emit('log', { message: `📦 Using cached proxies (age: ${cacheResult.cacheAge}s, ${allProxies.length} proxies)` });
+            socket.emit('log', { message: `📦 Using cached proxies (age: ${cacheResult.cacheAge}s)` });
           } else {
-            socket.emit('log', { message: `🔄 Fresh scrape completed: ${allProxies.length} proxies found` });
+            socket.emit('log', { message: `🔄 Fresh scrape completed: ${cacheResult.totalScraped} proxies found` });
           }
           
-          // Use all proxies (filter out only Unknown country)
+          if (cacheResult.validated && cacheResult.validationStats) {
+            if (cacheResult.validationStats.fallbackUsed) {
+              socket.emit('log', { message: `⚠️ TCP Validation: 0/${cacheResult.validationStats.total} reachable - FALLBACK MODE: using all proxies anyway (firewall may block TCP probes)` });
+            } else {
+              socket.emit('log', { message: `✅ TCP Validation: ${cacheResult.validationStats.validCount}/${cacheResult.validationStats.total} reachable (avg latency: ${cacheResult.validationStats.avgLatencyMs}ms)` });
+            }
+          }
+          
+          // Use all proxies (filter out only Unknown country if we have enough)
           proxies = allProxies.filter(p => p.country && p.country !== 'Unknown');
           
-          socket.emit('log', { message: `✅ ${proxies.length} proxies with known country (Elite: ${proxies.filter(p => p.anonymity === 'elite').length})` });
+          // If too few proxies have known country, include all validated proxies
+          if (proxies.length < 10 && allProxies.length > proxies.length) {
+            socket.emit('log', { message: `⚠️ Only ${proxies.length} proxies with known country, including all ${allProxies.length} validated proxies` });
+            proxies = allProxies;
+          } else {
+            socket.emit('log', { message: `✅ ${proxies.length} validated proxies with known country (Elite: ${proxies.filter(p => p.anonymity === 'elite').length})` });
+          }
           
           // Apply country whitelist filter if specified
           if (countryWhitelist && countryWhitelist.length > 0) {
@@ -395,9 +421,24 @@ io.on('connection', (socket) => {
                 lastError = error;
                 // Record proxy failure in history
                 recordProxyResult(targetUrl, proxy, false);
-                if (attempt < maxRetries - 1) {
+                
+                const errMsg = error.message || '';
+                
+                // Handle dead proxy - remove from cache and invalidate
+                if (errMsg.includes('unreachable') || errMsg.includes('ERR_PROXY_CONNECTION_FAILED') ||
+                    errMsg.includes('ERR_TUNNEL_CONNECTION_FAILED') || errMsg.includes('ERR_CONNECTION_REFUSED') ||
+                    errMsg.includes('TCP pre-check failed')) {
+                  removeFromCache(proxy.ip, proxy.port);
+                  invalidateProxy(proxy);
+                  if (attempt < maxRetries - 1) {
+                    socket.emit('log', {
+                      message: `  💀 [${taskIndex + 1}] Proxy DEAD: ${proxy.ip}:${proxy.port} - removed, trying next...`
+                    });
+                  }
+                  await new Promise(resolve => setTimeout(resolve, 200));
+                } else if (attempt < maxRetries - 1) {
                   socket.emit('log', {
-                    message: `  ⚠️ [${taskIndex + 1}] Failed with ${proxy.ip}:${proxy.port}: ${error.message} - retrying...`
+                    message: `  ⚠️ [${taskIndex + 1}] Failed with ${proxy.ip}:${proxy.port}: ${errMsg.substring(0, 100)} - retrying...`
                   });
                   // Small delay before retry
                   await new Promise(resolve => setTimeout(resolve, 500));
@@ -405,7 +446,54 @@ io.on('connection', (socket) => {
               }
             }
 
-            // All retries failed
+            // All proxy retries failed - try DIRECT connection as last resort
+            if (!isRunning) return null;
+            
+            try {
+              socket.emit('log', {
+                message: `  🌐 [${taskIndex + 1}] All proxies failed - trying DIRECT connection (no proxy)...`
+              });
+              
+              const directResult = await accessDirect(targetUrl, useHeadless);
+              successCount++;
+              completedCount++;
+              totalSuccessCount++;
+              totalCompletedCount++;
+              
+              socket.emit('result', {
+                index: taskIndex + 1,
+                proxy: 'DIRECT (no proxy)',
+                country: 'Local',
+                status: 'success',
+                statusCode: directResult.statusCode,
+                responseTime: directResult.responseTime,
+                title: directResult.title || 'N/A',
+                targetUrl: urls.length > 1 ? targetUrl : undefined
+              });
+              socket.emit('log', {
+                message: `  ✅ [${taskIndex + 1}] DIRECT connection success! Status: ${directResult.statusCode} | Time: ${directResult.responseTime}ms`
+              });
+              socket.emit('progress', {
+                completed: completedCount,
+                total: totalAccess,
+                success: successCount,
+                failed: failCount,
+                isInfinite,
+                currentLoop,
+                totalCompleted: totalCompletedCount,
+                totalSuccess: totalSuccessCount,
+                totalFailed: totalFailCount
+              });
+              
+              return directResult;
+            } catch (directError) {
+              // Direct connection also failed
+              socket.emit('log', {
+                message: `  ⚠️ [${taskIndex + 1}] Direct connection also failed: ${directError.message.substring(0, 100)}`
+              });
+            }
+
+            // All retries AND direct connection failed
             failCount++;
             completedCount++;
             totalFailCount++;
@@ -413,12 +501,12 @@ io.on('connection', (socket) => {
             
             socket.emit('result', {
               index: taskIndex + 1,
-              proxy: 'multiple',
+              proxy: 'multiple + direct',
               status: 'failed',
-              error: `All ${maxRetries} retries failed: ${lastError.message}`
+              error: `All ${maxRetries} proxy retries + direct failed: ${lastError.message}`
             });
             socket.emit('log', {
-              message: `  ❌ [${taskIndex + 1}] Failed after ${maxRetries} retries: ${lastError.message}`
+              message: `  ❌ [${taskIndex + 1}] Failed after ${maxRetries} retries + direct: ${lastError.message}`
             });
             socket.emit('progress', {
               completed: completedCount,

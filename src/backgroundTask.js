@@ -1,9 +1,10 @@
 const { scrapeProxies, parseCustomProxies } = require('./proxyScraper');
-const { accessWithProxy, verifyProxy } = require('./accessor');
+const { accessWithProxy, accessDirect, verifyProxy, filterBlacklistedProxies, getBlacklistStats } = require('./accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./proxyHistory');
-const { getProxies: getCachedProxies, clearCache: clearProxyCache } = require('./proxyCache');
+const { getProxies: getCachedProxies, getValidatedProxies, clearCache: clearProxyCache, removeFromCache } = require('./proxyCache');
 const { filterProxiesByCountry } = require('./countryFilter');
 const { sendDiscordNotification } = require('./discordNotifier');
+const { invalidateProxy } = require('./proxyValidator');
 const fs = require('fs');
 const path = require('path');
 
@@ -52,6 +53,7 @@ class BackgroundTaskManager {
         loopCount: this.task.loopCount,
         currentLoop: this.task.currentLoop,
         proxyCount: this.task.proxyCount,
+        proxyDetectedCount: this.task.proxyDetectedCount || 0,
         interrupted: this.task.interrupted || false,
         interruptedAt: this.task.interruptedAt || null
       },
@@ -146,6 +148,7 @@ class BackgroundTaskManager {
           loopCount: this.task.loopCount,
           currentLoop: this.task.currentLoop,
           proxyCount: this.task.proxyCount,
+          proxyDetectedCount: this.task.proxyDetectedCount || 0,
           running: this.task.running,
         },
         config: this._config,
@@ -305,7 +308,8 @@ class BackgroundTaskManager {
       loopMode,
       loopCount,
       currentLoop: 0,
-      proxyCount: 0
+      proxyCount: 0,
+      proxyDetectedCount: 0
     };
 
     if (urls.length > 1) {
@@ -315,6 +319,7 @@ class BackgroundTaskManager {
       this.addLog(`🚀 Background task started for: ${primaryUrl}`);
     }
     this.addLog(`⚙️ Config: ${totalAccess} accesses, concurrency ${concurrency}, delay ${delayMin}-${delayMax}ms`);
+    this.addLog(`🛡️ Anti-detection: puppeteer-extra stealth + WebRTC blocking + proxy blacklisting`);
     if (countryWhitelist && countryWhitelist.length > 0) {
       this.addLog(`🌍 Country Whitelist: ${countryWhitelist.join(', ')}`);
     }
@@ -378,20 +383,42 @@ class BackgroundTaskManager {
 
           this.addLog(`✅ Loaded ${proxies.length} custom proxies`);
         } else {
-          this.addLog('🔄 Loading proxies (cached or fresh scrape)...');
+          this.addLog('🔄 Loading proxies (cached or fresh scrape + TCP validation)...');
 
-          const cacheResult = await getCachedProxies();
+          const cacheResult = await getValidatedProxies({
+            maxValid: 60,
+            tcpTimeout: 4000,
+            onValidationProgress: (validated, total, validCount) => {
+              if (validated % 20 === 0 || validated === total) {
+                this.addLog(`  🔍 Validating: ${validated}/${total} checked, ${validCount} reachable`);
+              }
+            }
+          });
           const allProxies = cacheResult.proxies;
 
           if (cacheResult.fromCache) {
-            this.addLog(`📦 Using cached proxies (age: ${cacheResult.cacheAge}s, ${allProxies.length} proxies)`);
+            this.addLog(`📦 Using cached proxies (age: ${cacheResult.cacheAge}s)`);
           } else {
-            this.addLog(`🔄 Fresh scrape completed: ${allProxies.length} proxies found`);
+            this.addLog(`🔄 Fresh scrape completed: ${cacheResult.totalScraped} proxies found`);
+          }
+
+          if (cacheResult.validated && cacheResult.validationStats) {
+            if (cacheResult.validationStats.fallbackUsed) {
+              this.addLog(`⚠️ TCP Validation: 0/${cacheResult.validationStats.total} reachable - FALLBACK MODE: using all proxies anyway (firewall may block TCP probes)`);
+            } else {
+              this.addLog(`✅ TCP Validation: ${cacheResult.validationStats.validCount}/${cacheResult.validationStats.total} reachable (avg latency: ${cacheResult.validationStats.avgLatencyMs}ms)`);
+            }
           }
 
           proxies = allProxies.filter(p => p.country && p.country !== 'Unknown');
 
-          this.addLog(`✅ ${proxies.length} proxies with known country`);
+          // If too few proxies have known country, include all validated proxies
+          if (proxies.length < 10 && allProxies.length > proxies.length) {
+            this.addLog(`⚠️ Only ${proxies.length} proxies with known country, including all ${allProxies.length} validated proxies`);
+            proxies = allProxies;
+          } else {
+            this.addLog(`✅ ${proxies.length} validated proxies with known country`);
+          }
 
           // Apply country whitelist filter if specified
           if (countryWhitelist && countryWhitelist.length > 0) {
@@ -409,6 +436,37 @@ class BackgroundTaskManager {
             }
             proxies.push(...allProxies);
           }
+        }
+
+        // === PROXY ANONYMITY FILTERING ===
+        // Prefer elite proxies to avoid "Anonymous Proxy detected" errors
+        const eliteProxies = proxies.filter(p => p.anonymity === 'elite');
+        const highAnonProxies = proxies.filter(p => p.anonymity === 'anonymous' || p.anonymity === 'high');
+        const otherProxies = proxies.filter(p => !['elite', 'anonymous', 'high'].includes(p.anonymity));
+        
+        if (eliteProxies.length >= 10) {
+          // Use only elite proxies if we have enough
+          this.addLog(`🛡️ Using ${eliteProxies.length} ELITE proxies (best anonymity, avoids proxy detection)`);
+          proxies = eliteProxies;
+        } else if (eliteProxies.length + highAnonProxies.length >= 10) {
+          // Use elite + high anonymous
+          proxies = [...eliteProxies, ...highAnonProxies];
+          this.addLog(`🛡️ Using ${proxies.length} Elite+Anonymous proxies (${eliteProxies.length} elite, ${highAnonProxies.length} anonymous)`);
+        } else {
+          this.addLog(`⚠️ Only ${eliteProxies.length} elite proxies available - using all ${proxies.length} proxies`);
+        }
+
+        // === BLACKLIST FILTERING ===
+        // Remove proxies that were previously detected as proxies
+        const beforeBlacklist = proxies.length;
+        proxies = filterBlacklistedProxies(proxies);
+        if (beforeBlacklist !== proxies.length) {
+          this.addLog(`🚫 Removed ${beforeBlacklist - proxies.length} blacklisted proxies`);
+        }
+        
+        const blacklistStats = getBlacklistStats();
+        if (blacklistStats.active > 0) {
+          this.addLog(`📊 Blacklist: ${blacklistStats.active} active, ${blacklistStats.expired} expired`);
         }
 
         // === PROXY HISTORY FILTERING ===
@@ -474,18 +532,31 @@ class BackgroundTaskManager {
 
             if (!this.task.running) return null;
 
-            const maxRetries = verifyUrl ? 5 : 3;
+            // Increased retries for proxy detection scenarios
+            const maxRetries = verifyUrl ? 7 : 5;
             let lastError = null;
+            let proxyDetectedInTask = false;
 
             for (let attempt = 0; attempt < maxRetries; attempt++) {
               if (!this.task.running) return null;
 
-              const proxy = getNextProxy();
+              let proxy = getNextProxy();
+              
+              // Skip blacklisted proxies during retry
+              let skipCount = 0;
+              while (proxy && skipCount < shuffledProxies.length) {
+                try {
+                  const { isProxyBlacklisted } = require('./accessor');
+                  if (!isProxyBlacklisted(proxy)) break;
+                } catch(e) { break; }
+                proxy = getNextProxy();
+                skipCount++;
+              }
 
               if (attempt === 0) {
-                this.addLog(`[${taskIndex + 1}/${totalAccess}] Proxy: ${proxy.ip}:${proxy.port} (${proxy.country})`);
+                this.addLog(`[${taskIndex + 1}/${totalAccess}] Proxy: ${proxy.ip}:${proxy.port} (${proxy.country || 'Unknown'}, ${proxy.anonymity || 'unknown'})`);
               } else {
-                this.addLog(`  🔄 Retry #${attempt}: ${proxy.ip}:${proxy.port}`);
+                this.addLog(`  🔄 Retry #${attempt}: ${proxy.ip}:${proxy.port} (${proxy.anonymity || 'unknown'})`);
               }
 
               try {
@@ -495,7 +566,16 @@ class BackgroundTaskManager {
 
                   if (!verifyResult.success) {
                     recordProxyResult(targetUrl, proxy, false);
-                    lastError = new Error(`Verify failed: status ${verifyResult.statusCode}`);
+                    
+                    // If proxy was detected, log it specially
+                    if (verifyResult.proxyDetected) {
+                      this.task.proxyDetectedCount = (this.task.proxyDetectedCount || 0) + 1;
+                      this.addLog(`  🚫 Proxy DETECTED during verify: ${proxy.ip}:${proxy.port}`, 'warning');
+                      // Remove from cache so it's not reused
+                      removeFromCache(proxy.ip, proxy.port);
+                    }
+                    
+                    lastError = new Error(`Verify failed: status ${verifyResult.statusCode}${verifyResult.proxyDetected ? ' (PROXY DETECTED)' : ''}`);
                     await new Promise(resolve => setTimeout(resolve, 300));
                     continue;
                   }
@@ -514,6 +594,7 @@ class BackgroundTaskManager {
                   index: taskIndex + 1,
                   proxy: `${proxy.ip}:${proxy.port}`,
                   country: proxy.country,
+                  anonymity: proxy.anonymity,
                   status: 'success',
                   statusCode: result.statusCode,
                   responseTime: result.responseTime,
@@ -530,6 +611,7 @@ class BackgroundTaskManager {
                   total: totalAccess,
                   success: this.task.successCount,
                   failed: this.task.failCount,
+                  proxyDetected: this.task.proxyDetectedCount || 0,
                   isInfinite,
                   currentLoop: this.task.currentLoop,
                   totalCompleted: this.task.totalCompletedCount,
@@ -541,14 +623,81 @@ class BackgroundTaskManager {
               } catch (error) {
                 lastError = error;
                 recordProxyResult(targetUrl, proxy, false);
-                if (attempt < maxRetries - 1) {
-                  this.addLog(`  ⚠️ [${taskIndex + 1}] Failed: ${error.message} - retrying...`);
+                
+                const errMsg = error.message || '';
+                
+                // Check if this was a proxy detection error
+                if (errMsg.includes('PROXY_DETECTED')) {
+                  proxyDetectedInTask = true;
+                  this.task.proxyDetectedCount = (this.task.proxyDetectedCount || 0) + 1;
+                  this.addLog(`  🚫 [${taskIndex + 1}] PROXY DETECTED: ${proxy.ip}:${proxy.port} - switching proxy...`, 'warning');
+                  // Remove from cache
+                  removeFromCache(proxy.ip, proxy.port);
+                  // Longer delay before retry with new proxy
+                  await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000));
+                } else if (errMsg.includes('unreachable') || errMsg.includes('ERR_PROXY_CONNECTION_FAILED') ||
+                           errMsg.includes('ERR_TUNNEL_CONNECTION_FAILED') || errMsg.includes('ERR_CONNECTION_REFUSED') ||
+                           errMsg.includes('TCP pre-check failed')) {
+                  // Proxy is dead - remove from cache and invalidate immediately
+                  removeFromCache(proxy.ip, proxy.port);
+                  invalidateProxy(proxy);
+                  if (attempt < maxRetries - 1) {
+                    this.addLog(`  💀 [${taskIndex + 1}] Proxy DEAD: ${proxy.ip}:${proxy.port} - removed, trying next...`);
+                  }
+                  // Short delay - proxy is dead, just move to next one quickly
+                  await new Promise(resolve => setTimeout(resolve, 200));
+                } else if (attempt < maxRetries - 1) {
+                  this.addLog(`  ⚠️ [${taskIndex + 1}] Failed: ${errMsg.substring(0, 100)} - retrying...`);
                   await new Promise(resolve => setTimeout(resolve, 500));
                 }
               }
             }
 
-            // All retries failed
+            // All proxy retries failed - try DIRECT connection as last resort
+            if (!this.task.running) return null;
+            
+            try {
+              this.addLog(`  🌐 [${taskIndex + 1}] All proxies failed - trying DIRECT connection (no proxy)...`);
+              
+              const directResult = await accessDirect(targetUrl, useHeadless);
+              this.task.successCount++;
+              this.task.completedCount++;
+              this.task.totalSuccessCount++;
+              this.task.totalCompletedCount++;
+
+              this.addResult({
+                index: taskIndex + 1,
+                proxy: 'DIRECT (no proxy)',
+                country: 'Local',
+                status: 'success',
+                statusCode: directResult.statusCode,
+                responseTime: directResult.responseTime,
+                title: directResult.title || 'N/A',
+                targetUrl: urls.length > 1 ? targetUrl : undefined,
+                timestamp: new Date().toISOString()
+              });
+
+              this.addLog(`  ✅ [${taskIndex + 1}] DIRECT connection success! Status: ${directResult.statusCode} | Time: ${directResult.responseTime}ms`);
+
+              this.io.emit('bg-progress', {
+                completed: this.task.completedCount,
+                total: totalAccess,
+                success: this.task.successCount,
+                failed: this.task.failCount,
+                proxyDetected: this.task.proxyDetectedCount || 0,
+                isInfinite,
+                currentLoop: this.task.currentLoop,
+                totalCompleted: this.task.totalCompletedCount,
+                totalSuccess: this.task.totalSuccessCount,
+                totalFailed: this.task.totalFailCount
+              });
+
+              return directResult;
+            } catch (directError) {
+              this.addLog(`  ⚠️ [${taskIndex + 1}] Direct connection also failed: ${directError.message.substring(0, 100)}`);
+            }
+
+            // All retries AND direct connection failed
             this.task.failCount++;
             this.task.completedCount++;
             this.task.totalFailCount++;
@@ -556,19 +705,21 @@ class BackgroundTaskManager {
 
             this.addResult({
               index: taskIndex + 1,
-              proxy: 'multiple',
+              proxy: 'multiple + direct',
               status: 'failed',
-              error: `All ${maxRetries} retries failed: ${lastError.message}`,
+              proxyDetected: proxyDetectedInTask,
+              error: `All ${maxRetries} retries + direct failed: ${lastError.message}`,
               timestamp: new Date().toISOString()
             });
 
-            this.addLog(`  ❌ [${taskIndex + 1}] Failed after ${maxRetries} retries`);
+            this.addLog(`  ❌ [${taskIndex + 1}] Failed after ${maxRetries} retries + direct${proxyDetectedInTask ? ' (proxy detection issues)' : ''}`);
 
             this.io.emit('bg-progress', {
               completed: this.task.completedCount,
               total: totalAccess,
               success: this.task.successCount,
               failed: this.task.failCount,
+              proxyDetected: this.task.proxyDetectedCount || 0,
               isInfinite,
               currentLoop: this.task.currentLoop,
               totalCompleted: this.task.totalCompletedCount,
@@ -584,12 +735,21 @@ class BackgroundTaskManager {
         await this._runParallel(tasks, concurrency);
 
         this.addLog(`\n📊 Loop Summary: ${this.task.successCount} success, ${this.task.failCount} failed out of ${totalAccess}`);
+        if (this.task.proxyDetectedCount > 0) {
+          this.addLog(`🚫 Proxy detections this session: ${this.task.proxyDetectedCount}`, 'warning');
+        }
 
-        // Auto-refresh proxy cache if success rate is too low (< 20%)
+        // Auto-refresh proxy cache if success rate is too low (< 20%) or too many proxy detections
         if (proxySource !== 'custom' && this.task.completedCount > 0) {
           const successRate = this.task.successCount / this.task.completedCount;
-          if (successRate < 0.2) {
-            this.addLog(`⚠️ Low success rate (${Math.round(successRate * 100)}%) - refreshing proxy cache for next loop...`, 'warning');
+          const detectionRate = (this.task.proxyDetectedCount || 0) / this.task.completedCount;
+          
+          if (successRate < 0.2 || detectionRate > 0.3) {
+            if (detectionRate > 0.3) {
+              this.addLog(`⚠️ High proxy detection rate (${Math.round(detectionRate * 100)}%) - refreshing proxy cache...`, 'warning');
+            } else {
+              this.addLog(`⚠️ Low success rate (${Math.round(successRate * 100)}%) - refreshing proxy cache for next loop...`, 'warning');
+            }
             clearProxyCache();
             this.addLog('🔄 Proxy cache cleared. Fresh proxies will be scraped on next loop.');
           }
@@ -625,7 +785,8 @@ class BackgroundTaskManager {
       total: totalAccess,
       totalSuccess: this.task.totalSuccessCount,
       totalFailed: this.task.totalFailCount,
-      totalCompleted: this.task.totalCompletedCount
+      totalCompleted: this.task.totalCompletedCount,
+      proxyDetected: this.task.proxyDetectedCount || 0
     });
 
     // Send Discord notification on task complete
