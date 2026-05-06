@@ -87,9 +87,9 @@ function filterBlacklistedProxies(proxies) {
 }
 
 /**
- * Access a URL using a proxy (or direct connection if proxy is null)
+ * Access a URL using a proxy
  * @param {string} url - Target URL to access
- * @param {object|null} proxy - Proxy object {ip, port, type} or null for direct connection
+ * @param {object} proxy - Proxy object {ip, port, type}
  * @param {boolean} useHeadless - true = headless (hidden), false = visible browser window
  * @param {object} options - Additional options
  * @param {boolean} options.skipTCPCheck - Skip TCP pre-check (default: false)
@@ -98,11 +98,8 @@ async function accessWithProxy(url, proxy, useHeadless, options = {}) {
   const startTime = Date.now();
   const { skipTCPCheck = false } = options;
 
-  // === DIRECT CONNECTION MODE (no proxy) ===
   if (!proxy) {
-    console.log(`  🌐 Direct connection (no proxy) to: ${url}`);
-    await globalRateLimiter.acquire(url);
-    return await accessWithPuppeteer(url, null, startTime, useHeadless === undefined ? true : useHeadless);
+    throw new Error('Proxy is required - direct connections are not allowed');
   }
 
   // Check if proxy is blacklisted
@@ -136,13 +133,6 @@ async function accessWithProxy(url, proxy, useHeadless, options = {}) {
   }
 }
 
-/**
- * Access a URL with direct connection (no proxy) - convenience wrapper
- * Used as fallback when all proxies fail
- */
-async function accessDirect(url, useHeadless = true) {
-  return await accessWithProxy(url, null, useHeadless, { skipTCPCheck: true });
-}
 
 /**
  * Access URL using Puppeteer-Extra with Stealth Plugin for full anti-detection
@@ -680,7 +670,6 @@ async function verifyProxy(verifyUrl, proxy) {
 
 module.exports = {
   accessWithProxy,
-  accessDirect,
   verifyProxy,
   isProxyBlacklisted,
   filterBlacklistedProxies,

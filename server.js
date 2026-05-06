@@ -6,7 +6,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 const { scrapeProxies, parseCustomProxies } = require('./src/proxyScraper');
-const { accessWithProxy, accessDirect, verifyProxy } = require('./src/accessor');
+const { accessWithProxy, verifyProxy } = require('./src/accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./src/proxyHistory');
 const { getProxies: getCachedProxies, getValidatedProxies, getCacheStats, clearCache: clearProxyCache, removeFromCache } = require('./src/proxyCache');
 const { filterProxiesByCountry } = require('./src/countryFilter');
@@ -446,54 +446,9 @@ io.on('connection', (socket) => {
               }
             }
 
-            // All proxy retries failed - try DIRECT connection as last resort
+            // All proxy retries failed
             if (!isRunning) return null;
-            
-            try {
-              socket.emit('log', {
-                message: `  🌐 [${taskIndex + 1}] All proxies failed - trying DIRECT connection (no proxy)...`
-              });
-              
-              const directResult = await accessDirect(targetUrl, useHeadless);
-              successCount++;
-              completedCount++;
-              totalSuccessCount++;
-              totalCompletedCount++;
-              
-              socket.emit('result', {
-                index: taskIndex + 1,
-                proxy: 'DIRECT (no proxy)',
-                country: 'Local',
-                status: 'success',
-                statusCode: directResult.statusCode,
-                responseTime: directResult.responseTime,
-                title: directResult.title || 'N/A',
-                targetUrl: urls.length > 1 ? targetUrl : undefined
-              });
-              socket.emit('log', {
-                message: `  ✅ [${taskIndex + 1}] DIRECT connection success! Status: ${directResult.statusCode} | Time: ${directResult.responseTime}ms`
-              });
-              socket.emit('progress', {
-                completed: completedCount,
-                total: totalAccess,
-                success: successCount,
-                failed: failCount,
-                isInfinite,
-                currentLoop,
-                totalCompleted: totalCompletedCount,
-                totalSuccess: totalSuccessCount,
-                totalFailed: totalFailCount
-              });
-              
-              return directResult;
-            } catch (directError) {
-              // Direct connection also failed
-              socket.emit('log', {
-                message: `  ⚠️ [${taskIndex + 1}] Direct connection also failed: ${directError.message.substring(0, 100)}`
-              });
-            }
 
-            // All retries AND direct connection failed
             failCount++;
             completedCount++;
             totalFailCount++;
@@ -501,12 +456,12 @@ io.on('connection', (socket) => {
             
             socket.emit('result', {
               index: taskIndex + 1,
-              proxy: 'multiple + direct',
+              proxy: 'multiple',
               status: 'failed',
-              error: `All ${maxRetries} proxy retries + direct failed: ${lastError.message}`
+              error: `All ${maxRetries} proxy retries failed: ${lastError.message}`
             });
             socket.emit('log', {
-              message: `  ❌ [${taskIndex + 1}] Failed after ${maxRetries} retries + direct: ${lastError.message}`
+              message: `  ❌ [${taskIndex + 1}] Failed after ${maxRetries} proxy retries: ${lastError.message}`
             });
             socket.emit('progress', {
               completed: completedCount,

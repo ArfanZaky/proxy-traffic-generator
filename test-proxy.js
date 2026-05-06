@@ -241,24 +241,10 @@ async function main() {
   // ============================================================
   console.log('--- TEST 5: Full accessor.accessWithProxy() ---');
   
-  try {
-    const { accessWithProxy, accessDirect } = require('./src/accessor');
-    
-    // Test direct access first
-    console.log('  Testing accessDirect("https://httpbin.org/ip")...');
-    const startTime = Date.now();
-    const result = await accessDirect('https://httpbin.org/ip', true);
-    console.log(`  ✅ accessDirect succeeded!`);
-    console.log(`  Result: status=${result.statusCode}, time=${result.responseTime}ms, title="${result.title}"`);
-  } catch (e) {
-    console.log(`  ❌ accessDirect FAILED: ${e.message}`);
-    console.log(`  Stack: ${e.stack}`);
-  }
-
   // Test with proxy
   if (proxies.length > 0) {
     const proxy = proxies[0];
-    console.log(`\n  Testing accessWithProxy("https://httpbin.org/ip", ${proxy.ip}:${proxy.port})...`);
+    console.log(`  Testing accessWithProxy("https://httpbin.org/ip", ${proxy.ip}:${proxy.port})...`);
     try {
       const { accessWithProxy } = require('./src/accessor');
       const result = await accessWithProxy('https://httpbin.org/ip', proxy, true, { skipTCPCheck: false });

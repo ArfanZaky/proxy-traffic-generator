@@ -1,5 +1,5 @@
 const { scrapeProxies, parseCustomProxies } = require('./proxyScraper');
-const { accessWithProxy, accessDirect, verifyProxy, filterBlacklistedProxies, getBlacklistStats } = require('./accessor');
+const { accessWithProxy, verifyProxy, filterBlacklistedProxies, getBlacklistStats } = require('./accessor');
 const { recordProxyResult, filterProxiesByHistory, getHistoryStats } = require('./proxyHistory');
 const { getProxies: getCachedProxies, getValidatedProxies, clearCache: clearProxyCache, removeFromCache } = require('./proxyCache');
 const { filterProxiesByCountry } = require('./countryFilter');
@@ -653,51 +653,9 @@ class BackgroundTaskManager {
               }
             }
 
-            // All proxy retries failed - try DIRECT connection as last resort
+            // All proxy retries failed
             if (!this.task.running) return null;
-            
-            try {
-              this.addLog(`  🌐 [${taskIndex + 1}] All proxies failed - trying DIRECT connection (no proxy)...`);
-              
-              const directResult = await accessDirect(targetUrl, useHeadless);
-              this.task.successCount++;
-              this.task.completedCount++;
-              this.task.totalSuccessCount++;
-              this.task.totalCompletedCount++;
 
-              this.addResult({
-                index: taskIndex + 1,
-                proxy: 'DIRECT (no proxy)',
-                country: 'Local',
-                status: 'success',
-                statusCode: directResult.statusCode,
-                responseTime: directResult.responseTime,
-                title: directResult.title || 'N/A',
-                targetUrl: urls.length > 1 ? targetUrl : undefined,
-                timestamp: new Date().toISOString()
-              });
-
-              this.addLog(`  ✅ [${taskIndex + 1}] DIRECT connection success! Status: ${directResult.statusCode} | Time: ${directResult.responseTime}ms`);
-
-              this.io.emit('bg-progress', {
-                completed: this.task.completedCount,
-                total: totalAccess,
-                success: this.task.successCount,
-                failed: this.task.failCount,
-                proxyDetected: this.task.proxyDetectedCount || 0,
-                isInfinite,
-                currentLoop: this.task.currentLoop,
-                totalCompleted: this.task.totalCompletedCount,
-                totalSuccess: this.task.totalSuccessCount,
-                totalFailed: this.task.totalFailCount
-              });
-
-              return directResult;
-            } catch (directError) {
-              this.addLog(`  ⚠️ [${taskIndex + 1}] Direct connection also failed: ${directError.message.substring(0, 100)}`);
-            }
-
-            // All retries AND direct connection failed
             this.task.failCount++;
             this.task.completedCount++;
             this.task.totalFailCount++;
@@ -705,14 +663,14 @@ class BackgroundTaskManager {
 
             this.addResult({
               index: taskIndex + 1,
-              proxy: 'multiple + direct',
+              proxy: 'multiple',
               status: 'failed',
               proxyDetected: proxyDetectedInTask,
-              error: `All ${maxRetries} retries + direct failed: ${lastError.message}`,
+              error: `All ${maxRetries} proxy retries failed: ${lastError.message}`,
               timestamp: new Date().toISOString()
             });
 
-            this.addLog(`  ❌ [${taskIndex + 1}] Failed after ${maxRetries} retries + direct${proxyDetectedInTask ? ' (proxy detection issues)' : ''}`);
+            this.addLog(`  ❌ [${taskIndex + 1}] Failed after ${maxRetries} proxy retries${proxyDetectedInTask ? ' (proxy detection issues)' : ''}`);
 
             this.io.emit('bg-progress', {
               completed: this.task.completedCount,
