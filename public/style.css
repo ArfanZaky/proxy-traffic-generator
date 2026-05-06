@@ -686,6 +686,8 @@ section h2 i {
 .stat-info {
     display: flex;
     flex-direction: column;
+    flex: 1;
+    min-width: 0;
 }
 
 .stat-value {
@@ -699,6 +701,29 @@ section h2 i {
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.5px;
+}
+
+.stat-label-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.btn-copy-success {
+    margin-left: auto;
+    border: 1px solid var(--border-color);
+    background: transparent;
+    color: var(--text-muted);
+}
+
+.btn-copy-success:hover:not(:disabled) {
+    border-color: var(--success);
+    color: var(--success);
+}
+
+.btn-copy-success:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* ===== Progress Bar ===== */

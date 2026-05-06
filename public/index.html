@@ -283,7 +283,12 @@
                         <div class="stat-icon"><i class="fas fa-check-circle"></i></div>
                         <div class="stat-info">
                             <span class="stat-value" id="statSuccess">0</span>
-                            <span class="stat-label">Success</span>
+                            <div class="stat-label-row">
+                                <span class="stat-label">Success</span>
+                                <button id="copySuccessBtn" class="btn btn-xs btn-copy-success" type="button" disabled title="No successful proxy yet">
+                                    <i class="fas fa-copy"></i> Copy
+                                </button>
+                            </div>
                         </div>
                     </div>
                     <div class="stat-card stat-failed">

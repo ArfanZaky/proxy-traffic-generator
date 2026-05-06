@@ -46,6 +46,7 @@ const statFailed = document.getElementById('statFailed');
 const statProxies = document.getElementById('statProxies');
 const statSpeed = document.getElementById('statSpeed');
 const statRate = document.getElementById('statRate');
+const copySuccessBtn = document.getElementById('copySuccessBtn');
 
 // State
 let isRunning = false;
@@ -55,6 +56,7 @@ let failCount = 0;
 let startTime = null;
 let resultRows = 0;
 let proxySource = 'auto'; // 'auto' or 'custom'
+const successfulProxies = new Set();
 
 // Parse URLs from textarea (one per line)
 function parseUrls(text) {
@@ -246,8 +248,10 @@ startBtn.addEventListener('click', () => {
     successCount = 0;
     failCount = 0;
     resultRows = 0;
+    successfulProxies.clear();
     startTime = Date.now();
     updateStats();
+    updateCopySuccessButton();
     
     // Clear previous results
     resultsBody.innerHTML = '';
@@ -327,7 +331,9 @@ clearBtn.addEventListener('click', () => {
     failCount = 0;
     totalRequests = 0;
     resultRows = 0;
+    successfulProxies.clear();
     updateStats();
+    updateCopySuccessButton();
     progressContainer.style.display = 'none';
     statSpeed.textContent = '0';
     statRate.textContent = '0%';
@@ -452,6 +458,11 @@ function addResultRow(data) {
     while (resultsBody.children.length > 200) {
         resultsBody.removeChild(resultsBody.lastChild);
     }
+
+    if (data.status === 'success' && data.proxy) {
+        successfulProxies.add(String(data.proxy).trim());
+        updateCopySuccessButton();
+    }
 }
 
 function updateStats() {
@@ -480,6 +491,51 @@ function resetUI() {
     startBtn.innerHTML = '<i class="fas fa-play"></i> Start Traffic';
 }
 
+function updateCopySuccessButton() {
+    if (!copySuccessBtn) return;
+    const total = successfulProxies.size;
+    copySuccessBtn.disabled = total === 0;
+    copySuccessBtn.title = total > 0 ? `Copy ${total} successful proxies` : 'No successful proxy yet';
+}
+
+async function copyTextToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+    }
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+
+    const ok = document.execCommand('copy');
+    document.body.removeChild(textarea);
+    if (!ok) {
+        throw new Error('Copy command failed');
+    }
+}
+
+if (copySuccessBtn) {
+    copySuccessBtn.addEventListener('click', async () => {
+        if (successfulProxies.size === 0) {
+            addLog('⚠️ No successful proxies to copy yet', 'warning');
+            return;
+        }
+
+        const text = Array.from(successfulProxies).join('\n');
+        try {
+            await copyTextToClipboard(text);
+            addLog(`📋 Copied ${successfulProxies.size} successful proxies`, 'success');
+        } catch (err) {
+            addLog(`❌ Failed to copy successful proxies: ${err.message}`, 'error');
+        }
+    });
+}
+
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
@@ -492,6 +548,8 @@ setInterval(() => {
         updateSpeed();
     }
 }, 2000);
+
+updateCopySuccessButton();
 
 // === BACKGROUND MODE ===
 const bgModeToggle = document.getElementById('bgModeToggle');
@@ -798,6 +856,9 @@ startBtn.addEventListener('click', async (e) => {
         addLog('❌ Please enter at least one valid target URL', 'error');
         return;
     }
+
+    successfulProxies.clear();
+    updateCopySuccessButton();
 
     const verifyUrl = verifyUrlInput.value.trim();
     const totalAccess = parseInt(totalAccessInput.value) || 100;
