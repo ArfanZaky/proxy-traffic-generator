@@ -47,6 +47,11 @@ const statProxies = document.getElementById('statProxies');
 const statSpeed = document.getElementById('statSpeed');
 const statRate = document.getElementById('statRate');
 const copySuccessBtn = document.getElementById('copySuccessBtn');
+const detailSuccessBtn = document.getElementById('detailSuccessBtn');
+const detailModal = document.getElementById('detailModal');
+const modalCloseBtn = document.getElementById('modalCloseBtn');
+const detailTableBody = document.getElementById('detailTableBody');
+const modalProxyCount = document.getElementById('modalProxyCount');
 
 // State
 let isRunning = false;
@@ -57,7 +62,10 @@ let startTime = null;
 let resultRows = 0;
 let proxySource = 'auto'; // 'auto' or 'custom'
 const successfulProxies = new Set();
+const successfulProxyDetails = []; // Array of {proxy, country, ms}
 let allProxiesList = []; // Full list of all proxies from server
+let detailSortColumn = 'ms';
+let detailSortDirection = 'asc';
 
 // Parse URLs from textarea (one per line)
 function parseUrls(text) {
@@ -250,15 +258,16 @@ startBtn.addEventListener('click', () => {
     failCount = 0;
     resultRows = 0;
     successfulProxies.clear();
+    successfulProxyDetails.length = 0;
     startTime = Date.now();
     updateStats();
     updateCopySuccessButton();
-    
+
     // Clear previous results
     resultsBody.innerHTML = '';
     resultCount.textContent = '(0)';
     resultRows = 0;
-    
+
     // Show progress
     progressContainer.style.display = 'block';
     progressFill.style.width = '0%';
@@ -306,7 +315,7 @@ startBtn.addEventListener('click', () => {
     const urlsLabel = urls.length > 1 ? `${urls.length} URLs (random)` : url;
     addLog(`🚀 Starting traffic: ${totalAccess} requests × ${loopLabel} = ${totalLabel} total`, 'info');
     addLog(`🌐 Target: ${urlsLabel}`, 'info');
-    if (urls.length > 1) urls.forEach((u, i) => addLog(`   ${i+1}. ${u}`, 'info'));
+    if (urls.length > 1) urls.forEach((u, i) => addLog(`   ${i + 1}. ${u}`, 'info'));
     addLog(`⚡ Concurrency: ${concurrency} | Delay: ${delayMin}-${delayMax}ms | Mode: ${useHeadless ? 'Headless' : 'Visible'} | Proxy: ${sourceLabel}`, 'info');
     if (countryWhitelist.length > 0) {
         addLog(`🌍 Country Whitelist: ${countryWhitelist.join(', ')}`, 'info');
@@ -333,6 +342,7 @@ clearBtn.addEventListener('click', () => {
     totalRequests = 0;
     resultRows = 0;
     successfulProxies.clear();
+    successfulProxyDetails.length = 0;
     updateStats();
     updateCopySuccessButton();
     progressContainer.style.display = 'none';
@@ -347,7 +357,7 @@ socket.on('log', (data) => {
     if (data.message.includes('✅')) type = 'success';
     else if (data.message.includes('❌')) type = 'error';
     else if (data.message.includes('⚠️') || data.message.includes('⛔')) type = 'warning';
-    
+
     addLog(data.message, type);
 });
 
@@ -361,13 +371,13 @@ socket.on('proxies-count', (data) => {
 
 socket.on('progress', (data) => {
     const { completed, total, success, failed, isInfinite: isInf, currentLoop: loop, totalCompleted, totalSuccess, totalFailed } = data;
-    
+
     // Progress bar always shows per-loop progress
     const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
     progressFill.style.width = `${percent}%`;
     progressFill.style.opacity = '';
     progressPercent.textContent = `${percent}%`;
-    
+
     if (isInf) {
         progressLabel.textContent = `${completed} / ${total} (Loop ${loop || '?'})`;
         // Use cumulative stats for infinite mode
@@ -378,7 +388,7 @@ socket.on('progress', (data) => {
         successCount = success;
         failCount = failed;
     }
-    
+
     updateStats();
     updateSpeed();
 });
@@ -412,19 +422,19 @@ socket.on('connect', () => {
 function addLog(message, type = 'info') {
     const entry = document.createElement('div');
     entry.className = `log-entry log-${type}`;
-    
+
     const now = new Date();
     const time = now.toLocaleTimeString('en-US', { hour12: false });
-    
+
     entry.innerHTML = `<span class="log-time">[${time}]</span><span class="log-message">${escapeHtml(message)}</span>`;
-    
+
     logContainer.appendChild(entry);
-    
+
     // Limit log entries to prevent memory issues
     while (logContainer.children.length > 500) {
         logContainer.removeChild(logContainer.firstChild);
     }
-    
+
     if (autoScrollToggle.checked) {
         logContainer.scrollTop = logContainer.scrollHeight;
     }
@@ -441,7 +451,7 @@ function addResultRow(data) {
     const row = document.createElement('tr');
     const statusClass = data.status === 'success' ? 'status-success' : 'status-failed';
     const statusIcon = data.status === 'success' ? '✅' : '❌';
-    
+
     row.innerHTML = `
         <td>${data.index}</td>
         <td>${escapeHtml(data.proxy)}</td>
@@ -451,7 +461,7 @@ function addResultRow(data) {
         <td>${data.responseTime ? data.responseTime + 'ms' : '-'}</td>
         <td title="${escapeHtml(data.title || data.error || '-')}">${escapeHtml((data.title || data.error || '-').substring(0, 35))}</td>
     `;
-    
+
     // Add to top for latest first
     if (resultsBody.firstChild) {
         resultsBody.insertBefore(row, resultsBody.firstChild);
@@ -465,7 +475,15 @@ function addResultRow(data) {
     }
 
     if (data.status === 'success' && data.proxy) {
-        successfulProxies.add(String(data.proxy).trim());
+        const proxyStr = String(data.proxy).trim();
+        successfulProxies.add(proxyStr);
+        // Store detail info
+        const proxyFormatted = proxyStr.startsWith('http') ? proxyStr : `http://${proxyStr}`;
+        successfulProxyDetails.push({
+            proxy: proxyFormatted,
+            country: data.country || '-',
+            ms: data.responseTime || 0
+        });
         updateCopySuccessButton();
     }
 }
@@ -474,7 +492,7 @@ function updateStats() {
     statTotal.textContent = totalRequests;
     statSuccess.textContent = successCount;
     statFailed.textContent = failCount;
-    
+
     const total = successCount + failCount;
     const rate = total > 0 ? Math.round((successCount / total) * 100) : 0;
     statRate.textContent = `${rate}%`;
@@ -497,14 +515,24 @@ function resetUI() {
 }
 
 function updateCopySuccessButton() {
-    if (!copySuccessBtn) return;
     const successTotal = successfulProxies.size;
-    if (successTotal > 0) {
-        copySuccessBtn.disabled = false;
-        copySuccessBtn.title = `Copy ${successTotal} successful proxies`;
-    } else {
-        copySuccessBtn.disabled = true;
-        copySuccessBtn.title = 'No successful proxies yet';
+    if (copySuccessBtn) {
+        if (successTotal > 0) {
+            copySuccessBtn.disabled = false;
+            copySuccessBtn.title = `Copy ${successTotal} successful proxies`;
+        } else {
+            copySuccessBtn.disabled = true;
+            copySuccessBtn.title = 'No successful proxies yet';
+        }
+    }
+    if (detailSuccessBtn) {
+        if (successTotal > 0) {
+            detailSuccessBtn.disabled = false;
+            detailSuccessBtn.title = `View ${successTotal} successful proxies detail`;
+        } else {
+            detailSuccessBtn.disabled = true;
+            detailSuccessBtn.title = 'No successful proxies yet';
+        }
     }
 }
 
@@ -531,12 +559,12 @@ async function copyTextToClipboard(text) {
 
 if (copySuccessBtn) {
     copySuccessBtn.addEventListener('click', async () => {
-        // Copy only proxies that were successfully used
-        if (successfulProxies.size > 0) {
-            const text = Array.from(successfulProxies).join('\n');
+        // Copy only proxies that were successfully used in http://host:port format
+        if (successfulProxyDetails.length > 0) {
+            const text = successfulProxyDetails.map(p => p.proxy).join('\n');
             try {
                 await copyTextToClipboard(text);
-                addLog(`📋 Copied ${successfulProxies.size} successful proxies to clipboard`, 'success');
+                addLog(`📋 Copied ${successfulProxyDetails.length} successful proxies to clipboard`, 'success');
             } catch (err) {
                 addLog(`❌ Failed to copy proxies: ${err.message}`, 'error');
             }
@@ -544,6 +572,103 @@ if (copySuccessBtn) {
             addLog('⚠️ No successful proxies to copy yet', 'warning');
         }
     });
+}
+
+// Detail button - show modal with sortable table
+if (detailSuccessBtn) {
+    detailSuccessBtn.addEventListener('click', () => {
+        if (successfulProxyDetails.length === 0) {
+            addLog('⚠️ No successful proxies to show yet', 'warning');
+            return;
+        }
+        renderDetailModal();
+        detailModal.style.display = 'flex';
+    });
+}
+
+// Modal close
+if (modalCloseBtn) {
+    modalCloseBtn.addEventListener('click', () => {
+        detailModal.style.display = 'none';
+    });
+}
+
+// Close modal on overlay click
+if (detailModal) {
+    detailModal.addEventListener('click', (e) => {
+        if (e.target === detailModal) {
+            detailModal.style.display = 'none';
+        }
+    });
+}
+
+// Close modal on Escape key
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && detailModal && detailModal.style.display !== 'none') {
+        detailModal.style.display = 'none';
+    }
+});
+
+// Sort handler for detail table
+document.querySelectorAll('.modal-table th.sortable').forEach(th => {
+    th.addEventListener('click', () => {
+        const column = th.dataset.sort;
+        if (detailSortColumn === column) {
+            detailSortDirection = detailSortDirection === 'asc' ? 'desc' : 'asc';
+        } else {
+            detailSortColumn = column;
+            detailSortDirection = 'asc';
+        }
+        // Update sort indicators
+        document.querySelectorAll('.modal-table th.sortable').forEach(h => {
+            h.classList.remove('sort-asc', 'sort-desc');
+        });
+        th.classList.add(detailSortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
+        renderDetailModal();
+    });
+});
+
+function renderDetailModal() {
+    if (!detailTableBody) return;
+
+    // Sort data
+    const sorted = [...successfulProxyDetails].sort((a, b) => {
+        let valA, valB;
+        switch (detailSortColumn) {
+            case 'proxy':
+                valA = a.proxy.toLowerCase();
+                valB = b.proxy.toLowerCase();
+                break;
+            case 'country':
+                valA = a.country.toLowerCase();
+                valB = b.country.toLowerCase();
+                break;
+            case 'ms':
+                valA = Number(a.ms) || 0;
+                valB = Number(b.ms) || 0;
+                break;
+            default:
+                valA = a.ms;
+                valB = b.ms;
+        }
+        if (valA < valB) return detailSortDirection === 'asc' ? -1 : 1;
+        if (valA > valB) return detailSortDirection === 'asc' ? 1 : -1;
+        return 0;
+    });
+
+    // Update count
+    if (modalProxyCount) {
+        modalProxyCount.textContent = `${sorted.length} proxies`;
+    }
+
+    // Render rows
+    detailTableBody.innerHTML = sorted.map(item => `
+        <tr>
+            <td>${escapeHtml(item.proxy)}</td>
+            <td>${escapeHtml(item.country)}</td>
+            <td>${item.ms}ms</td>
+        </tr>
+    `).join('');
 }
 
 function escapeHtml(text) {
@@ -594,21 +719,21 @@ async function checkBgStatus() {
     try {
         const res = await fetch('/api/background/status');
         const data = await res.json();
-        
+
         if (data.running) {
             const isInfiniteMode = data.task.loopCount === -1;
-            
+
             // For infinite mode, show cumulative stats
             const displaySuccess = isInfiniteMode ? (data.task.totalSuccessCount || data.task.successCount) : data.task.successCount;
             const displayFailed = isInfiniteMode ? (data.task.totalFailCount || data.task.failCount) : data.task.failCount;
             const displayCompleted = isInfiniteMode ? (data.task.totalCompletedCount || data.task.completedCount) : data.task.completedCount;
-            
+
             // Status bar
             bgStatusBar.style.display = 'flex';
             bgStatusIndicator.className = 'bg-status-indicator running';
             bgStatusText.textContent = `Running: ${data.task.url} | ✅${displaySuccess} ❌${displayFailed} (Loop ${data.task.currentLoop})`;
             bgStopBtn.style.display = 'inline-block';
-            
+
             // Monitor panel
             bgMonitorPanel.style.display = 'block';
             bgMonitorPulse.className = 'bg-pulse';
@@ -621,7 +746,7 @@ async function checkBgStatus() {
             bgMonitorFailed.textContent = displayFailed;
             bgMonitorCompleted.textContent = displayCompleted;
             bgMonitorTarget.textContent = data.task.totalAccess;
-            
+
             // Progress - shows per-loop progress
             const total = data.task.totalAccess;
             const completed = data.task.completedCount; // per-loop completed
@@ -630,7 +755,7 @@ async function checkBgStatus() {
                 bgMonitorProgressFill.style.width = `${pct}%`;
                 bgMonitorProgressText.textContent = `${pct}%`;
             }
-            
+
             // Logs (show new ones)
             if (data.logs && data.logs.length > bgLogsShown) {
                 const newLogs = data.logs.slice(bgLogsShown);
@@ -643,21 +768,21 @@ async function checkBgStatus() {
                 bgLogsShown = data.logs.length;
                 bgMonitorLogs.scrollTop = bgMonitorLogs.scrollHeight;
             }
-            
+
         } else if (data.task) {
             // Task finished - check if interrupted (resumable)
             const isInterrupted = data.task.interrupted;
-            
+
             bgStatusBar.style.display = 'flex';
             bgStatusIndicator.className = 'bg-status-indicator stopped';
             bgStopBtn.style.display = 'none';
-            
+
             if (isInterrupted) {
                 bgStatusText.textContent = `⚠️ Interrupted: ✅${data.task.totalSuccessCount || data.task.successCount} ❌${data.task.totalFailCount || data.task.failCount} (Loop ${data.task.currentLoop})`;
             } else {
                 bgStatusText.textContent = `Completed: ✅${data.task.successCount} ❌${data.task.failCount}`;
             }
-            
+
             // Monitor panel - show completed/interrupted state
             bgMonitorPanel.style.display = 'block';
             bgMonitorPulse.className = isInterrupted ? 'bg-pulse stopped' : 'bg-pulse completed';
@@ -672,7 +797,7 @@ async function checkBgStatus() {
             bgMonitorTarget.textContent = data.task.totalAccess;
             bgMonitorProgressFill.style.width = isInterrupted ? '0%' : '100%';
             bgMonitorProgressText.textContent = isInterrupted ? 'Paused' : '100%';
-            
+
             // Show resume button if interrupted
             if (bgMonitorResumeBtn) {
                 bgMonitorResumeBtn.style.display = isInterrupted ? 'inline-block' : 'none';
@@ -757,7 +882,7 @@ async function checkResumableState() {
             bgMonitorProgressText.textContent = 'Paused';
             bgMonitorStopBtn.style.display = 'none';
             if (bgMonitorResumeBtn) bgMonitorResumeBtn.style.display = 'inline-block';
-            
+
             bgStatusBar.style.display = 'flex';
             bgStatusIndicator.className = 'bg-status-indicator stopped';
             bgStatusText.textContent = `⚠️ Resumable: ${data.info.url} (Loop ${data.info.currentLoop})`;
@@ -792,13 +917,13 @@ socket.on('bg-result', (data) => {
 socket.on('bg-progress', (data) => {
     progressContainer.style.display = 'block';
     const { completed, total, success, failed, isInfinite, currentLoop, totalCompleted, totalSuccess, totalFailed } = data;
-    
+
     // Progress bar always shows per-loop progress (completed/total per loop)
     const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
     progressFill.style.width = `${percent}%`;
     progressFill.style.opacity = '';
     progressPercent.textContent = `${percent}%`;
-    
+
     if (isInfinite) {
         progressLabel.textContent = `${completed} / ${total} (Loop ${currentLoop || '?'})`;
         // Show cumulative stats for infinite mode
@@ -820,7 +945,7 @@ socket.on('bg-progress', (data) => {
             statRate.textContent = `${Math.round((success / completed) * 100)}%`;
         }
     }
-    
+
     // Update monitor panel stats in real-time
     if (bgMonitorPanel && bgMonitorPanel.style.display !== 'none') {
         if (isInfinite) {
@@ -840,7 +965,7 @@ socket.on('bg-progress', (data) => {
         const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
         bgMonitorProgressFill.style.width = `${pct}%`;
         bgMonitorProgressText.textContent = `${pct}%`;
-        
+
         if (currentLoop) {
             bgMonitorLoop.textContent = isInfinite ? `${currentLoop} (∞)` : currentLoop;
         }
@@ -856,10 +981,10 @@ socket.on('bg-complete', (data) => {
 const originalStartHandler = startBtn.onclick;
 startBtn.addEventListener('click', async (e) => {
     if (!bgModeToggle || !bgModeToggle.checked) return; // Let normal handler work
-    
+
     e.stopImmediatePropagation();
     e.preventDefault();
-    
+
     const urls = parseUrls(targetUrlInput.value);
     const url = urls[0] || '';
     if (urls.length === 0) {
@@ -868,6 +993,7 @@ startBtn.addEventListener('click', async (e) => {
     }
 
     successfulProxies.clear();
+    successfulProxyDetails.length = 0;
     updateCopySuccessButton();
 
     const verifyUrl = verifyUrlInput.value.trim();
@@ -912,7 +1038,7 @@ startBtn.addEventListener('click', async (e) => {
             body: JSON.stringify(body)
         });
         const result = await res.json();
-        
+
         if (result.success) {
             addLog('🖥️ Background task started! You can close this browser - task will keep running on server.', 'success');
             checkBgStatus();
@@ -933,7 +1059,7 @@ async function updateCacheStatus() {
     try {
         const res = await fetch('/api/cache/status');
         const data = await res.json();
-        
+
         if (data.cachedCount > 0 && data.isValid) {
             const ageMin = Math.floor(data.cacheAge / 60);
             const ageSec = data.cacheAge % 60;

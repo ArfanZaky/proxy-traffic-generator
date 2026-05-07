@@ -283,12 +283,7 @@
                         <div class="stat-icon"><i class="fas fa-check-circle"></i></div>
                         <div class="stat-info">
                             <span class="stat-value" id="statSuccess">0</span>
-                            <div class="stat-label-row">
-                                <span class="stat-label">Success</span>
-                                <button id="copySuccessBtn" class="btn btn-xs btn-copy-success" type="button" disabled title="No successful proxy yet">
-                                    <i class="fas fa-copy"></i> Copy
-                                </button>
-                            </div>
+                            <span class="stat-label">Success</span>
                         </div>
                     </div>
                     <div class="stat-card stat-failed">
@@ -329,6 +324,15 @@
                     <div class="progress-bar">
                         <div class="progress-fill" id="progressFill"></div>
                     </div>
+                </div>
+                <!-- Success Proxy Actions -->
+                <div class="success-proxy-actions">
+                    <button id="copySuccessBtn" class="btn btn-success-action" type="button" disabled title="No successful proxy yet">
+                        <i class="fas fa-copy"></i> Copy Success Proxy
+                    </button>
+                    <button id="detailSuccessBtn" class="btn btn-detail-action" type="button" disabled title="No successful proxy yet">
+                        <i class="fas fa-list-alt"></i> Detail
+                    </button>
                 </div>
             </section>
 
@@ -380,6 +384,35 @@
         <footer class="footer">
             <p>Proxy Traffic Generator &copy; 2024 | Proxies from <a href="https://spys.one/en/https-ssl-proxy/" target="_blank">spys.one</a> + fallback sources</p>
         </footer>
+    </div>
+
+    <!-- Detail Modal -->
+    <div class="modal-overlay" id="detailModal" style="display:none;">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-list-alt"></i> Success Proxy Detail</h3>
+                <button class="modal-close" id="modalCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-info">
+                    <span id="modalProxyCount">0 proxies</span>
+                </div>
+                <div class="modal-table-container">
+                    <table class="modal-table" id="detailTable">
+                        <thead>
+                            <tr>
+                                <th class="sortable" data-sort="proxy">Proxy <i class="fas fa-sort"></i></th>
+                                <th class="sortable" data-sort="country">Country <i class="fas fa-sort"></i></th>
+                                <th class="sortable" data-sort="ms">Ms <i class="fas fa-sort"></i></th>
+                            </tr>
+                        </thead>
+                        <tbody id="detailTableBody">
+                            <tr><td colspan="3" class="empty-detail">No data</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="/socket.io/socket.io.js"></script>
