@@ -2,6 +2,9 @@ const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 const { SocksProxyAgent } = require('socks-proxy-agent');
 const https = require('https');
+const os = require('os');
+const path = require('path');
+const fs = require('fs');
 const { generateFingerprint, applyFingerprint, getLaunchArgs, humanMouseMove, simulateIdleBehavior, checkProxyDetection, PROXY_DETECTION_REGEX } = require('./antiDetection');
 const { globalRateLimiter } = require('./rateLimiter');
 const { quickCheck, invalidateProxy, getProxyServerArg } = require('./proxyValidator');
@@ -40,13 +43,13 @@ function isProxyBlacklisted(proxy) {
   const key = `${proxy.ip}:${proxy.port}`;
   const entry = proxyBlacklist.get(key);
   if (!entry) return false;
-  
+
   // Check if blacklist has expired
   if (Date.now() - entry.lastDetected > BLACKLIST_TTL_MS) {
     proxyBlacklist.delete(key);
     return false;
   }
-  
+
   return entry.detectedCount >= BLACKLIST_THRESHOLD;
 }
 
@@ -60,7 +63,7 @@ function recordProxyDetection(proxy, reason) {
   entry.lastDetected = Date.now();
   entry.reason = reason;
   proxyBlacklist.set(key, entry);
-  
+
   console.log(`  ⚠️ Proxy ${key} detected (${entry.detectedCount}x): ${reason}`);
   if (entry.detectedCount >= BLACKLIST_THRESHOLD) {
     console.log(`  🚫 Proxy ${key} BLACKLISTED for ${BLACKLIST_TTL_MS / 60000} minutes`);
@@ -74,7 +77,7 @@ function getBlacklistStats() {
   const now = Date.now();
   let active = 0;
   let expired = 0;
-  
+
   for (const [key, entry] of proxyBlacklist) {
     if (now - entry.lastDetected > BLACKLIST_TTL_MS) {
       expired++;
@@ -82,7 +85,7 @@ function getBlacklistStats() {
       active++;
     }
   }
-  
+
   return { total: proxyBlacklist.size, active, expired };
 }
 
@@ -93,12 +96,28 @@ function filterBlacklistedProxies(proxies) {
   const before = proxies.length;
   const filtered = proxies.filter(p => !isProxyBlacklisted(p));
   const removed = before - filtered.length;
-  
+
   if (removed > 0) {
     console.log(`  🚫 Filtered ${removed} blacklisted proxies (${filtered.length} remaining)`);
   }
-  
+
   return filtered;
+}
+
+/**
+ * Clean up temporary user data directory
+ */
+function cleanupTempDir(dirPath) {
+  if (!dirPath) return;
+
+  try {
+    if (fs.existsSync(dirPath)) {
+      fs.rmSync(dirPath, { recursive: true, force: true, maxRetries: 3 });
+    }
+  } catch (error) {
+    // Ignore cleanup errors - Windows may lock files temporarily
+    console.warn(`⚠️ Failed to cleanup temp dir ${dirPath}: ${error.message}`);
+  }
 }
 
 /**
@@ -155,14 +174,18 @@ async function accessWithProxy(url, proxy, useHeadless, options = {}) {
  */
 async function accessWithPuppeteer(url, proxy, startTime, headless) {
   let browser = null;
-  
+  let tempUserDataDir = null;
+
   // Generate unique fingerprint for this session
   const fingerprint = generateFingerprint();
-  
+
   try {
+    // Create temporary user data directory
+    tempUserDataDir = path.join(os.tmpdir(), `puppeteer_${Date.now()}_${Math.random().toString(36).substring(7)}`);
+
     // Get anti-detection launch args based on fingerprint
     const stealthArgs = getLaunchArgs(fingerprint);
-    
+
     // Build launch args - include proxy only if proxy is provided
     const launchArgs = [...stealthArgs];
     if (proxy) {
@@ -171,13 +194,14 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
       // Chrome already routes DNS through the proxy for HTTPS (via CONNECT tunnel)
       // Do NOT use --host-resolver-rules as it breaks DNS resolution
     }
-    
+
     browser = await puppeteer.launch({
       headless: headless ? 'new' : false,
       args: launchArgs,
       defaultViewport: null,
       timeout: 60000,
-      ignoreDefaultArgs: ['--enable-automation']
+      ignoreDefaultArgs: ['--enable-automation'],
+      userDataDir: tempUserDataDir
     });
 
     const page = await browser.newPage();
@@ -191,7 +215,7 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
           password: proxy.password
         });
       }
-      
+
       // Apply full fingerprint (user-agent, viewport, headers, stealth scripts)
       await applyFingerprint(page, fingerprint);
 
@@ -209,7 +233,8 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     } catch (error) {
       if (error.message?.includes('Session closed') || error.name === 'TargetCloseError') {
         console.warn('⚠️ Page closed during initialization - retrying with different proxy');
-        if (browser) { try { await browser.close(); } catch(e) {} }
+        if (browser) { try { await browser.close(); } catch (e) { } }
+        cleanupTempDir(tempUserDataDir);
         throw new Error('Page closed during initialization');
       }
       throw error;
@@ -230,8 +255,9 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     if (detectionResult.detected) {
       // Record this proxy as detected
       recordProxyDetection(proxy, detectionResult.reason);
-      
+
       await browser.close();
+      cleanupTempDir(tempUserDataDir);
       throw new Error(`PROXY_DETECTED: ${detectionResult.reason}`);
     }
 
@@ -264,6 +290,7 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     if (detectionResult2.detected) {
       recordProxyDetection(proxy, detectionResult2.reason);
       await browser.close();
+      cleanupTempDir(tempUserDataDir);
       throw new Error(`PROXY_DETECTED: ${detectionResult2.reason}`);
     }
 
@@ -293,6 +320,9 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
 
     await browser.close();
 
+    // Cleanup temporary directory
+    cleanupTempDir(tempUserDataDir);
+
     return {
       statusCode,
       responseTime,
@@ -302,22 +332,25 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
     };
   } catch (error) {
     if (browser) {
-      try { await browser.close(); } catch(e) {}
+      try { await browser.close(); } catch (e) { }
     }
-    
+
+    // Cleanup temporary directory on error
+    cleanupTempDir(tempUserDataDir);
+
     // Specifically handle proxy connection failures - invalidate the proxy
     const errMsg = error.message || '';
     if (errMsg.includes('ERR_PROXY_CONNECTION_FAILED') ||
-        errMsg.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
-        errMsg.includes('ERR_PROXY_CERTIFICATE_INVALID') ||
-        errMsg.includes('ERR_SOCKS_CONNECTION_FAILED') ||
-        errMsg.includes('ERR_CONNECTION_RESET') ||
-        errMsg.includes('ERR_CONNECTION_REFUSED') ||
-        errMsg.includes('ERR_CONNECTION_TIMED_OUT')) {
+      errMsg.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
+      errMsg.includes('ERR_PROXY_CERTIFICATE_INVALID') ||
+      errMsg.includes('ERR_SOCKS_CONNECTION_FAILED') ||
+      errMsg.includes('ERR_CONNECTION_RESET') ||
+      errMsg.includes('ERR_CONNECTION_REFUSED') ||
+      errMsg.includes('ERR_CONNECTION_TIMED_OUT')) {
       // Mark this proxy as dead in the validation cache
       invalidateProxy(proxy);
     }
-    
+
     throw new Error(`Browser: ${error.message.substring(0, 150)}`);
   }
 }
@@ -328,7 +361,7 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
  */
 async function detectAndClickAds(page) {
   const AD_CLICK_TIMEOUT = 15000; // 15 seconds timeout for ad page loading
-  
+
   // 80% chance to click ads, 20% chance to skip
   const random = Math.random();
   if (random > 0.8) {
@@ -336,31 +369,31 @@ async function detectAndClickAds(page) {
     return;
   }
   console.log(`  Ad click probability: ${(random * 100).toFixed(1)}% (will click ads)`);
-  
+
   try {
     // Detect ad iframes and clickable ad elements
     const adInfo = await page.evaluate(() => {
       const ads = [];
-      
+
       // 1. Find ad iframes (like the example: iframe with specific sizes)
       const iframes = document.querySelectorAll('iframe');
       iframes.forEach((iframe, index) => {
         const width = iframe.width || iframe.offsetWidth || 0;
         const height = iframe.height || iframe.offsetHeight || 0;
         const src = iframe.src || '';
-        
+
         // Common ad sizes: 728x90, 300x250, 160x600, 320x50, 468x60, 336x280, 970x90
         const adSizes = [
           [728, 90], [300, 250], [160, 600], [320, 50],
           [468, 60], [336, 280], [970, 90], [970, 250],
           [300, 600], [250, 250], [200, 200], [120, 600]
         ];
-        
+
         const isAdSize = adSizes.some(([w, h]) =>
           (parseInt(width) === w && parseInt(height) === h) ||
           (Math.abs(parseInt(width) - w) < 10 && Math.abs(parseInt(height) - h) < 10)
         );
-        
+
         // Check if iframe looks like an ad
         const isAd = isAdSize ||
           src.includes('ad') ||
@@ -372,7 +405,7 @@ async function detectAndClickAds(page) {
           iframe.className?.toLowerCase().includes('ad') ||
           iframe.getAttribute('data-ad') !== null ||
           (iframe.getAttribute('bis_size') !== null); // bis_size attribute from the example
-        
+
         if (isAd && iframe.offsetWidth > 0 && iframe.offsetHeight > 0) {
           const rect = iframe.getBoundingClientRect();
           ads.push({
@@ -386,7 +419,7 @@ async function detectAndClickAds(page) {
           });
         }
       });
-      
+
       // 2. Find common ad containers/links
       const adSelectors = [
         '[class*="ad-banner"]', '[class*="ad_banner"]',
@@ -398,7 +431,7 @@ async function detectAndClickAds(page) {
         '.adsbygoogle', '[class*="sponsored"]',
         'ins.adsbygoogle'
       ];
-      
+
       adSelectors.forEach(selector => {
         try {
           const elements = document.querySelectorAll(selector);
@@ -418,9 +451,9 @@ async function detectAndClickAds(page) {
               }
             }
           });
-        } catch(e) {}
+        } catch (e) { }
       });
-      
+
       return ads;
     });
 
@@ -433,7 +466,7 @@ async function detectAndClickAds(page) {
 
     // Click the first visible ad
     const targetAd = adInfo.find(ad => ad.visible) || adInfo[0];
-    
+
     if (targetAd) {
       // Scroll to ad if needed
       await page.evaluate((ad) => {
@@ -442,7 +475,7 @@ async function detectAndClickAds(page) {
           behavior: 'smooth'
         });
       }, targetAd);
-      
+
       await new Promise(resolve => setTimeout(resolve, 1000));
 
       // Use human-like mouse movement to click ad
@@ -450,7 +483,7 @@ async function detectAndClickAds(page) {
 
       // Remember original URL
       const originalUrl = page.url();
-      
+
       // Click the ad
       try {
         if (targetAd.type === 'iframe') {
@@ -476,12 +509,12 @@ async function detectAndClickAds(page) {
             waitUntil: 'load',
             timeout: AD_CLICK_TIMEOUT
           });
-          
+
           console.log(`  Ad page loaded: ${page.url()}`);
-          
+
           // Wait a bit on the ad page (simulate reading)
           await new Promise(resolve => setTimeout(resolve, 3000));
-          
+
         } catch (navError) {
           // Navigation timeout or no navigation happened (ad opened in new tab)
           console.log('  Ad click: no navigation or timeout (may have opened in new tab)');
@@ -511,7 +544,7 @@ async function detectAndClickAds(page) {
                   await pages[i].close();
                   console.log('  Closed ad tab');
                 }
-              } catch(e) {}
+              } catch (e) { }
             }
           }
         }
@@ -555,7 +588,7 @@ async function autoScroll(page, direction = 'down') {
       } else {
         let scrolled = 0;
         const currentPos = window.pageYOffset || document.documentElement.scrollTop;
-        
+
         const timer = setInterval(() => {
           const step = distance + Math.floor(Math.random() * 50) - 25;
           window.scrollBy(0, -step);
@@ -599,12 +632,12 @@ async function verifyProxy(verifyUrl, proxy) {
 
   // Generate fingerprint for consistent headers
   const fingerprint = generateFingerprint();
-  
+
   try {
     // Build proxy agent based on proxy type (HTTP vs SOCKS5)
     let agent;
     const proxyType = (proxy.type || 'HTTP').toUpperCase();
-    
+
     if (proxyType === 'SOCKS5' || proxyType === 'SOCKS' || proxyType === 'SOCKS4') {
       // Use SOCKS proxy agent for SOCKS proxies
       let socksUrl;
@@ -625,7 +658,7 @@ async function verifyProxy(verifyUrl, proxy) {
       }
       agent = new HttpsProxyAgent(proxyUrl);
     }
-    
+
     const response = await axios.get(verifyUrl, {
       httpAgent: agent,
       httpsAgent: agent,
@@ -669,11 +702,11 @@ async function verifyProxy(verifyUrl, proxy) {
     // Invalidate proxy on connection errors
     const errMsg = error.message || '';
     if (errMsg.includes('ECONNREFUSED') || errMsg.includes('ETIMEDOUT') ||
-        errMsg.includes('ECONNRESET') || errMsg.includes('socket hang up') ||
-        errMsg.includes('EHOSTUNREACH') || errMsg.includes('ENETUNREACH')) {
+      errMsg.includes('ECONNRESET') || errMsg.includes('socket hang up') ||
+      errMsg.includes('EHOSTUNREACH') || errMsg.includes('ENETUNREACH')) {
       invalidateProxy(proxy);
     }
-    
+
     return {
       success: false,
       statusCode: 0,

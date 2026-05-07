@@ -371,7 +371,7 @@ function generateSecChUa(browser) {
  * These override browser APIs to prevent fingerprint detection
  */
 function getStealthScripts(fingerprint) {
-  return function(fp) {
+  return function (fp) {
     // Override navigator.webdriver
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
 
@@ -418,7 +418,7 @@ function getStealthScripts(fingerprint) {
 
     // Override WebGL fingerprint
     const getParameter = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+    WebGLRenderingContext.prototype.getParameter = function (parameter) {
       if (parameter === 37445) return fp.webglVendor; // UNMASKED_VENDOR_WEBGL
       if (parameter === 37446) return fp.webglRenderer; // UNMASKED_RENDERER_WEBGL
       return getParameter.call(this, parameter);
@@ -427,7 +427,7 @@ function getStealthScripts(fingerprint) {
     // Also override WebGL2
     if (typeof WebGL2RenderingContext !== 'undefined') {
       const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-      WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+      WebGL2RenderingContext.prototype.getParameter = function (parameter) {
         if (parameter === 37445) return fp.webglVendor;
         if (parameter === 37446) return fp.webglRenderer;
         return getParameter2.call(this, parameter);
@@ -436,7 +436,7 @@ function getStealthScripts(fingerprint) {
 
     // Override canvas fingerprint (add noise)
     const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = function(type) {
+    HTMLCanvasElement.prototype.toDataURL = function (type) {
       if (this.width === 0 || this.height === 0) return originalToDataURL.apply(this, arguments);
       const ctx = this.getContext('2d');
       if (ctx) {
@@ -452,7 +452,7 @@ function getStealthScripts(fingerprint) {
 
     // Override Intl.DateTimeFormat for timezone
     const originalResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
-    Intl.DateTimeFormat.prototype.resolvedOptions = function() {
+    Intl.DateTimeFormat.prototype.resolvedOptions = function () {
       const result = originalResolvedOptions.call(this);
       result.timeZone = fp.timezone;
       return result;
@@ -460,7 +460,7 @@ function getStealthScripts(fingerprint) {
 
     // Chrome-specific: window.chrome
     if (!window.chrome) {
-      window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {} };
+      window.chrome = { runtime: {}, loadTimes: function () { }, csi: function () { } };
     }
 
     // Override permissions query
@@ -480,30 +480,30 @@ function getStealthScripts(fingerprint) {
     // ============================================================
     // WebRTC Leak Prevention - Critical for proxy anonymity
     // ============================================================
-    
+
     // Block WebRTC from leaking real IP
     if (window.RTCPeerConnection) {
       const OriginalRTCPeerConnection = window.RTCPeerConnection;
-      window.RTCPeerConnection = function(config, constraints) {
+      window.RTCPeerConnection = function (config, constraints) {
         // Force all ICE candidates through the proxy by disabling local candidates
         if (config && config.iceServers) {
           config.iceServers = [];
         }
         config = config || {};
         config.iceServers = [];
-        
+
         const pc = new OriginalRTCPeerConnection(config, constraints);
-        
+
         // Override onicecandidate to filter local IPs
         const originalAddEventListener = pc.addEventListener.bind(pc);
-        pc.addEventListener = function(type, listener, options) {
+        pc.addEventListener = function (type, listener, options) {
           if (type === 'icecandidate') {
-            const wrappedListener = function(event) {
+            const wrappedListener = function (event) {
               if (event.candidate && event.candidate.candidate) {
                 // Block candidates that reveal local/real IP
                 const candidate = event.candidate.candidate;
-                if (candidate.includes('srflx') || candidate.includes('relay') || 
-                    candidate.includes('host')) {
+                if (candidate.includes('srflx') || candidate.includes('relay') ||
+                  candidate.includes('host')) {
                   // Create a modified event with null candidate
                   const modifiedEvent = new Event('icecandidate');
                   modifiedEvent.candidate = null;
@@ -517,7 +517,7 @@ function getStealthScripts(fingerprint) {
           }
           return originalAddEventListener(type, listener, options);
         };
-        
+
         return pc;
       };
       window.RTCPeerConnection.prototype = OriginalRTCPeerConnection.prototype;
@@ -547,8 +547,8 @@ function getStealthScripts(fingerprint) {
         chargingTime: 0,
         dischargingTime: Infinity,
         level: 1.0,
-        addEventListener: () => {},
-        removeEventListener: () => {}
+        addEventListener: () => { },
+        removeEventListener: () => { }
       });
     }
 
@@ -556,7 +556,7 @@ function getStealthScripts(fingerprint) {
     if (window.AudioContext || window.webkitAudioContext) {
       const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
       const originalCreateOscillator = OriginalAudioContext.prototype.createOscillator;
-      OriginalAudioContext.prototype.createOscillator = function() {
+      OriginalAudioContext.prototype.createOscillator = function () {
         const oscillator = originalCreateOscillator.call(this);
         // Add slight randomness to frequency
         const originalFrequency = oscillator.frequency;
@@ -605,6 +605,12 @@ function getLaunchArgs(fingerprint) {
     '--metrics-recording-only',
     '--no-first-run',
     '--safebrowsing-disable-auto-update',
+    // Storage optimization - reduce temporary file usage
+    '--disk-cache-size=0',
+    '--media-cache-size=0',
+    '--disable-application-cache',
+    '--disable-offline-load-stale-cache',
+    '--disable-cache',
     // NOTE: DNS leak prevention is handled in accessor.js (only when proxy is active)
     // Do NOT add --host-resolver-rules here as it breaks direct connections
   ];
@@ -653,10 +659,10 @@ async function checkProxyDetection(page) {
     const content = await page.content();
     const bodyText = await page.evaluate(() => document.body ? document.body.innerText : '');
     const title = await page.title();
-    
+
     // Check page content for proxy detection messages
     const textToCheck = `${title} ${bodyText}`.toLowerCase();
-    
+
     if (PROXY_DETECTION_REGEX.test(textToCheck)) {
       const match = textToCheck.match(PROXY_DETECTION_REGEX);
       return {
@@ -679,9 +685,9 @@ async function checkProxyDetection(page) {
     }
 
     // Check for Cloudflare challenge
-    if (content.includes('cf-browser-verification') || 
-        content.includes('cf_chl_opt') ||
-        content.includes('challenge-platform')) {
+    if (content.includes('cf-browser-verification') ||
+      content.includes('cf_chl_opt') ||
+      content.includes('challenge-platform')) {
       return {
         detected: true,
         reason: 'Cloudflare challenge detected (proxy may be flagged)'
@@ -700,7 +706,7 @@ async function checkProxyDetection(page) {
  */
 function generateMouseMovements(startX, startY, endX, endY, steps = null) {
   if (!steps) steps = randomInt(5, 15);
-  
+
   const movements = [];
   const controlX = startX + (endX - startX) * Math.random();
   const controlY = startY + (endY - startY) * Math.random();
@@ -731,7 +737,7 @@ async function humanMouseMove(page, targetX, targetY) {
   }));
 
   const movements = generateMouseMovements(currentPos.x, currentPos.y, targetX, targetY);
-  
+
   for (const move of movements) {
     await page.mouse.move(move.x, move.y);
     await new Promise(resolve => setTimeout(resolve, move.delay));
@@ -743,10 +749,10 @@ async function humanMouseMove(page, targetX, targetY) {
  */
 async function simulateIdleBehavior(page, durationMs = 3000) {
   const startTime = Date.now();
-  
+
   while (Date.now() - startTime < durationMs) {
     const action = Math.random();
-    
+
     if (action < 0.3) {
       // Small mouse movement
       const x = randomInt(100, 1200);
@@ -759,7 +765,7 @@ async function simulateIdleBehavior(page, durationMs = 3000) {
       });
     }
     // else: do nothing (idle)
-    
+
     await new Promise(resolve => setTimeout(resolve, randomInt(200, 800)));
   }
 }
