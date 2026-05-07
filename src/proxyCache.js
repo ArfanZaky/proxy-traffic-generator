@@ -124,16 +124,18 @@ function removeFromCache(proxyIp, proxyPort) {
  *
  * @param {object} options - Same as getProxies() plus validation options
  * @param {boolean} options.validate - Whether to run TCP validation (default: true)
- * @param {number} options.maxValid - Max proxies to validate (default: 50, 0 = all)
  * @param {number} options.tcpTimeout - TCP check timeout ms (default: 4000)
+ * @param {boolean} options.doConnectTest - Also test HTTP CONNECT (default: false)
+ * @param {number} options.concurrency - Max concurrent validations (default: 100)
  * @param {function} options.onValidationProgress - Progress callback
  * @returns {Object} { proxies, fromCache, validated, stats }
  */
 async function getValidatedProxies(options = {}) {
   const {
     validate = true,
-    maxValid = 50,
     tcpTimeout = 4000,
+    doConnectTest = false,  // TCP-only by default - CONNECT test is too strict for free proxies
+    concurrency = 100,
     onValidationProgress = null,
     ...cacheOptions
   } = options;
@@ -145,13 +147,12 @@ async function getValidatedProxies(options = {}) {
     return { ...cacheResult, validated: false, validationStats: null };
   }
 
-  // Run batch validation with HTTP CONNECT test
-  // TCP-only validation is insufficient - many proxies accept TCP but refuse HTTPS tunneling
+  // Run batch validation - TCP only by default (fast, validates ALL proxies)
+  // doConnectTest=true would reject most free proxies since they accept TCP but refuse CONNECT
   const validationResult = await batchValidateProxies(cacheResult.proxies, {
-    concurrency: 30,
-    maxValid,
+    concurrency,  // High concurrency to handle full proxy list fast
     tcpTimeout,
-    doConnectTest: true,  // Actually verify HTTPS CONNECT tunneling works
+    doConnectTest,  // TCP-only by default, caller can opt-in to CONNECT test
     onProgress: onValidationProgress
   });
 

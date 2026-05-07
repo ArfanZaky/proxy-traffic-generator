@@ -57,6 +57,7 @@ let startTime = null;
 let resultRows = 0;
 let proxySource = 'auto'; // 'auto' or 'custom'
 const successfulProxies = new Set();
+let allProxiesList = []; // Full list of all proxies from server
 
 // Parse URLs from textarea (one per line)
 function parseUrls(text) {
@@ -352,6 +353,10 @@ socket.on('log', (data) => {
 
 socket.on('proxies-count', (data) => {
     statProxies.textContent = data.count;
+    if (data.list && Array.isArray(data.list)) {
+        allProxiesList = data.list;
+    }
+    updateCopySuccessButton();
 });
 
 socket.on('progress', (data) => {
@@ -493,9 +498,14 @@ function resetUI() {
 
 function updateCopySuccessButton() {
     if (!copySuccessBtn) return;
-    const total = successfulProxies.size;
-    copySuccessBtn.disabled = total === 0;
-    copySuccessBtn.title = total > 0 ? `Copy ${total} successful proxies` : 'No successful proxy yet';
+    const successTotal = successfulProxies.size;
+    if (successTotal > 0) {
+        copySuccessBtn.disabled = false;
+        copySuccessBtn.title = `Copy ${successTotal} successful proxies`;
+    } else {
+        copySuccessBtn.disabled = true;
+        copySuccessBtn.title = 'No successful proxies yet';
+    }
 }
 
 async function copyTextToClipboard(text) {
@@ -521,17 +531,17 @@ async function copyTextToClipboard(text) {
 
 if (copySuccessBtn) {
     copySuccessBtn.addEventListener('click', async () => {
-        if (successfulProxies.size === 0) {
+        // Copy only proxies that were successfully used
+        if (successfulProxies.size > 0) {
+            const text = Array.from(successfulProxies).join('\n');
+            try {
+                await copyTextToClipboard(text);
+                addLog(`📋 Copied ${successfulProxies.size} successful proxies to clipboard`, 'success');
+            } catch (err) {
+                addLog(`❌ Failed to copy proxies: ${err.message}`, 'error');
+            }
+        } else {
             addLog('⚠️ No successful proxies to copy yet', 'warning');
-            return;
-        }
-
-        const text = Array.from(successfulProxies).join('\n');
-        try {
-            await copyTextToClipboard(text);
-            addLog(`📋 Copied ${successfulProxies.size} successful proxies`, 'success');
-        } catch (err) {
-            addLog(`❌ Failed to copy successful proxies: ${err.message}`, 'error');
         }
     });
 }

@@ -370,6 +370,7 @@ class BackgroundTaskManager {
 
       try {
         let proxies = [];
+        let proxiesValidated = false;
 
         if (proxySource === 'custom' && customProxies.trim()) {
           this.addLog('📋 Parsing custom proxies...');
@@ -386,10 +387,10 @@ class BackgroundTaskManager {
           this.addLog('🔄 Loading proxies (cached or fresh scrape + TCP validation)...');
 
           const cacheResult = await getValidatedProxies({
-            maxValid: 60,
             tcpTimeout: 4000,
+            concurrency: 100,
             onValidationProgress: (validated, total, validCount) => {
-              if (validated % 20 === 0 || validated === total) {
+              if (validated % 50 === 0 || validated === total) {
                 this.addLog(`  🔍 Validating: ${validated}/${total} checked, ${validCount} reachable`);
               }
             }
@@ -436,6 +437,7 @@ class BackgroundTaskManager {
             }
             proxies.push(...allProxies);
           }
+          proxiesValidated = true;
         }
 
         // === PROXY ANONYMITY FILTERING ===
@@ -470,7 +472,8 @@ class BackgroundTaskManager {
         }
 
         // === PROXY HISTORY FILTERING ===
-        const historyResult = filterProxiesByHistory(primaryUrl, proxies);
+        // Pass validated flag so currently-validated proxies are not excluded by stale history
+        const historyResult = filterProxiesByHistory(primaryUrl, proxies, { validated: proxiesValidated });
         const historyStats = getHistoryStats(primaryUrl);
 
         if (historyStats.successCount > 0 || historyStats.failedCount > 0) {

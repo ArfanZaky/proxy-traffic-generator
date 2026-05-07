@@ -95,13 +95,21 @@ function recordProxyResult(url, proxy, success) {
 /**
  * Filter and prioritize proxies based on history for a URL
  * Returns: { prioritized: [...], unused: [...], failed: [...] }
- * 
+ *
  * Priority order:
  * 1. Proxies that succeeded before (sorted by success count, most first)
  * 2. Proxies never used before (new/unknown)
- * 3. Proxies that failed before are EXCLUDED
+ * 3. Proxies that failed before are EXCLUDED (unless validated = true)
+ *
+ * @param {string} url - Target URL to check history for
+ * @param {Array} proxies - List of proxy objects to filter
+ * @param {Object} options - Options
+ * @param {boolean} options.validated - If true, proxies have passed current TCP/CONNECT validation.
+ *   Previously-failed proxies that are now validated will be given a second chance (moved to "unused")
+ *   instead of being excluded. This prevents stale history from blocking currently-working proxies.
  */
-function filterProxiesByHistory(url, proxies) {
+function filterProxiesByHistory(url, proxies, options = {}) {
+  const { validated = false } = options;
   const history = loadHistory();
   const urlKey = normalizeUrl(url);
   
@@ -132,8 +140,14 @@ function filterProxiesByHistory(url, proxies) {
         lastUsed: urlHistory.success[proxyKey].lastUsed
       });
     } else if (urlHistory.failed[proxyKey]) {
-      // This proxy failed before - exclude it
-      failedProxies.push(proxy);
+      if (validated) {
+        // Proxy failed before BUT passed current TCP/CONNECT validation
+        // Give it a second chance - treat as "unused" (lower priority than proven good)
+        unusedProxies.push(proxy);
+      } else {
+        // Proxy failed before and NOT currently validated - exclude it
+        failedProxies.push(proxy);
+      }
     } else {
       // Never used before - include as unused
       unusedProxies.push(proxy);

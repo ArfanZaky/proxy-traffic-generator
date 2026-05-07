@@ -246,10 +246,10 @@ async function validateProxy(proxy, options = {}) {
 /**
  * Batch validate proxies with concurrency control
  * Returns only valid proxies, sorted by latency (fastest first)
+ * IMPORTANT: This function validates ALL proxies - no early termination.
  * @param {Array} proxies - Array of proxy objects
  * @param {object} options - Validation options
- * @param {number} options.concurrency - Max concurrent validations (default: 20)
- * @param {number} options.maxValid - Stop after finding this many valid proxies (default: 0 = all)
+ * @param {number} options.concurrency - Max concurrent validations (default: 100)
  * @param {number} options.tcpTimeout - TCP timeout per proxy (default: 5000)
  * @param {boolean} options.doConnectTest - Also test HTTP CONNECT (default: false)
  * @param {function} options.onProgress - Progress callback (validated, total, validCount)
@@ -257,8 +257,7 @@ async function validateProxy(proxy, options = {}) {
  */
 async function batchValidateProxies(proxies, options = {}) {
   const {
-    concurrency = 20,
-    maxValid = 0,
+    concurrency = 100,
     tcpTimeout = 5000,
     doConnectTest = false,
     onProgress = null
@@ -267,25 +266,17 @@ async function batchValidateProxies(proxies, options = {}) {
   const valid = [];
   const invalid = [];
   let validated = 0;
-  let stopped = false;
 
   // Process in batches
   const queue = [...proxies];
   const executing = new Set();
 
   const processOne = async (proxy) => {
-    if (stopped) return;
-
     const result = await validateProxy(proxy, { tcpTimeout, doConnectTest });
     validated++;
 
     if (result.valid) {
       valid.push({ proxy, latencyMs: result.latencyMs });
-      
-      // Stop early if we have enough valid proxies
-      if (maxValid > 0 && valid.length >= maxValid) {
-        stopped = true;
-      }
     } else {
       invalid.push({ proxy, error: result.error, reason: result.reason });
     }
@@ -295,9 +286,8 @@ async function batchValidateProxies(proxies, options = {}) {
     }
   };
 
-  // Run with concurrency limit
+  // Run with concurrency limit - process ALL proxies, never stop early
   for (const proxy of queue) {
-    if (stopped) break;
 
     const p = processOne(proxy).then(() => {
       executing.delete(p);

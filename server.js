@@ -1,5 +1,14 @@
 process.setMaxListeners(100);
 
+// Suppress TargetCloseError from puppeteer-extra-plugin-stealth race conditions
+process.on('unhandledRejection', (reason, promise) => {
+  if (reason && (reason.message?.includes('Session closed') || reason.name === 'TargetCloseError')) {
+    console.warn('⚠️ Suppressed TargetCloseError (page closed during stealth plugin init)');
+    return;
+  }
+  console.error('Unhandled Rejection:', reason);
+});
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -186,6 +195,7 @@ io.on('connection', (socket) => {
 
       try {
         let proxies = [];
+        let proxiesValidated = false;
 
         if (proxySource === 'custom' && customProxies.trim()) {
           // Use custom proxies provided by user
@@ -204,8 +214,8 @@ io.on('connection', (socket) => {
           socket.emit('log', { message: '🔄 Loading proxies (cached or fresh scrape + TCP validation)...' });
           
           const cacheResult = await getValidatedProxies({
-            maxValid: 60,
             tcpTimeout: 4000,
+            concurrency: 100,
             onValidationProgress: (validated, total, validCount) => {
               if (validated % 25 === 0 || validated === total) {
                 socket.emit('log', { message: `  🔍 Validating: ${validated}/${total} checked, ${validCount} reachable` });
@@ -255,10 +265,12 @@ io.on('connection', (socket) => {
             }
             proxies.push(...allProxies);
           }
+          proxiesValidated = true;
         }
 
         // === PROXY HISTORY FILTERING ===
-        const historyResult = filterProxiesByHistory(primaryUrl, proxies);
+        // Pass validated flag so currently-validated proxies are not excluded by stale history
+        const historyResult = filterProxiesByHistory(primaryUrl, proxies, { validated: proxiesValidated });
         const historyStats = getHistoryStats(primaryUrl);
         
         if (historyStats.successCount > 0 || historyStats.failedCount > 0) {
@@ -286,7 +298,7 @@ io.on('connection', (socket) => {
           return urls[Math.floor(Math.random() * urls.length)];
         }
 
-        socket.emit('proxies-count', { count: proxies.length });
+        socket.emit('proxies-count', { count: proxies.length, list: proxies.map(p => `${p.ip}:${p.port}`) });
         if (urls.length > 1) {
           socket.emit('log', { message: `🌐 ${urls.length} Target URLs (random distribution):` });
           urls.forEach((u, i) => socket.emit('log', { message: `   ${i+1}. ${u}` }));

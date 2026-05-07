@@ -10,6 +10,21 @@ const { quickCheck, invalidateProxy, getProxyServerArg } = require('./proxyValid
 process.setMaxListeners(100);
 
 // ============================================================
+// PUPPETEER-EXTRA STEALTH PLUGIN REGISTRATION (module-level singleton)
+// Must only be registered ONCE to avoid duplicate _onTargetCreated listeners
+// ============================================================
+let puppeteer;
+try {
+  puppeteer = require('puppeteer-extra');
+  const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+  puppeteer.use(StealthPlugin());
+} catch (e) {
+  // Fallback to regular puppeteer if puppeteer-extra not available
+  console.log('⚠️ puppeteer-extra not available, using regular puppeteer');
+  puppeteer = require('puppeteer');
+}
+
+// ============================================================
 // PROXY QUALITY TRACKER
 // Tracks proxy detection events to blacklist bad proxies
 // ============================================================
@@ -145,18 +160,6 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
   const fingerprint = generateFingerprint();
   
   try {
-    // Use puppeteer-extra with stealth plugin for better anti-detection
-    let puppeteer;
-    try {
-      puppeteer = require('puppeteer-extra');
-      const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-      puppeteer.use(StealthPlugin());
-    } catch (e) {
-      // Fallback to regular puppeteer if puppeteer-extra not available
-      console.log('  ⚠️ puppeteer-extra not available, using regular puppeteer');
-      puppeteer = require('puppeteer');
-    }
-
     // Get anti-detection launch args based on fingerprint
     const stealthArgs = getLaunchArgs(fingerprint);
     
@@ -179,27 +182,37 @@ async function accessWithPuppeteer(url, proxy, startTime, headless) {
 
     const page = await browser.newPage();
 
-    // Authenticate proxy if username/password provided
-    if (proxy && proxy.username && proxy.password) {
-      await page.authenticate({
-        username: proxy.username,
-        password: proxy.password
-      });
-    }
-    
-    // Apply full fingerprint (user-agent, viewport, headers, stealth scripts)
-    await applyFingerprint(page, fingerprint);
-
-    // Block WebRTC at the CDP level for extra protection
+    // Wrap page setup in try-catch for TargetCloseError handling
     try {
-      const client = await page.target().createCDPSession();
-      await client.send('Network.setBypassServiceWorker', { bypass: true });
-      // Disable WebRTC via CDP
-      await client.send('Emulation.setHardwareConcurrencyOverride', { 
-        hardwareConcurrency: fingerprint.hardwareConcurrency 
-      });
-    } catch (e) {
-      // CDP commands may not be available in all versions
+      // Authenticate proxy if username/password provided
+      if (proxy && proxy.username && proxy.password) {
+        await page.authenticate({
+          username: proxy.username,
+          password: proxy.password
+        });
+      }
+      
+      // Apply full fingerprint (user-agent, viewport, headers, stealth scripts)
+      await applyFingerprint(page, fingerprint);
+
+      // Block WebRTC at the CDP level for extra protection
+      try {
+        const client = await page.target().createCDPSession();
+        await client.send('Network.setBypassServiceWorker', { bypass: true });
+        // Disable WebRTC via CDP
+        await client.send('Emulation.setHardwareConcurrencyOverride', {
+          hardwareConcurrency: fingerprint.hardwareConcurrency
+        });
+      } catch (e) {
+        // CDP commands may not be available in all versions
+      }
+    } catch (error) {
+      if (error.message?.includes('Session closed') || error.name === 'TargetCloseError') {
+        console.warn('⚠️ Page closed during initialization - retrying with different proxy');
+        if (browser) { try { await browser.close(); } catch(e) {} }
+        throw new Error('Page closed during initialization');
+      }
+      throw error;
     }
 
     // Navigate to URL - use domcontentloaded for reliability with proxies
@@ -493,9 +506,11 @@ async function detectAndClickAds(page) {
             if (pages[i] !== page) {
               try {
                 // Wait briefly on the ad tab
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                await pages[i].close();
-                console.log('  Closed ad tab');
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                if (!pages[i].isClosed()) {
+                  await pages[i].close();
+                  console.log('  Closed ad tab');
+                }
               } catch(e) {}
             }
           }

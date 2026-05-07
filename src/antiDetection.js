@@ -615,9 +615,11 @@ function getLaunchArgs(fingerprint) {
  */
 async function applyFingerprint(page, fingerprint) {
   // Set user agent
+  if (page.isClosed()) return;
   await page.setUserAgent(fingerprint.userAgent);
 
   // Set viewport with device scale factor
+  if (page.isClosed()) return;
   await page.setViewport({
     width: fingerprint.viewport.width,
     height: fingerprint.viewport.height,
@@ -625,12 +627,15 @@ async function applyFingerprint(page, fingerprint) {
   });
 
   // Set extra HTTP headers
+  if (page.isClosed()) return;
   await page.setExtraHTTPHeaders(fingerprint.headers);
 
   // Inject stealth scripts before any page loads
+  if (page.isClosed()) return;
   await page.evaluateOnNewDocument(getStealthScripts(fingerprint), fingerprint);
 
   // Emulate timezone
+  if (page.isClosed()) return;
   try {
     await page.emulateTimezone(fingerprint.timezone);
   } catch (e) {
